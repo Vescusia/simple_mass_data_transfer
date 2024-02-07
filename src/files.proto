@@ -1,0 +1,12 @@
+syntax  = "proto3";
+package smd_transfer.files;
+
+message PathFile {
+  enum Type {
+    FILE = 0;
+    DIRECTORY = 1;
+  }
+  Type type = 1;
+  string name = 2;
+  uint64 size = 3;
+}

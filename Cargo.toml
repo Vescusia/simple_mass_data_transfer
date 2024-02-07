@@ -1,0 +1,20 @@
+[package]
+name = "simple_mass_data_transfer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "smd_transfer"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "^4.4.18", features = ["derive", "suggestions"] }
+clio = "^0.3.5"
+prost = "^0.12.3"
+anyhow = "^1.0.79"
+
+[build-dependencies]
+prost-build = "^0.12.3"
+protobuf-src = "^1.1.0"
