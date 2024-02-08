@@ -1,12 +1,25 @@
 syntax  = "proto3";
 package smd_transfer.files;
 
+// The main file-header sent before the file bytes
 message PathFile {
-  enum Type {
-    FILE = 0;
-    DIRECTORY = 1;
-  }
-  Type type = 1;
-  string name = 2;
+  // The path relative to the main file/directory
+  string rel_path = 2;
+  // The size of the file in bytes
   uint64 size = 3;
+}
+
+// The md5 checksum of the file sent after the bytes
+message FileSum {
+  fixed64 md5_high = 1;
+  fixed64 md5_low = 2;
+}
+
+enum FileSumResponseType {
+  MATCH = 0;
+  NO_MATCH = 1;
+}
+// The response to the FileSum sent
+message FileSumResponse {
+  FileSumResponseType response = 1;
 }
