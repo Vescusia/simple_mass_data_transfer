@@ -2,6 +2,7 @@ use super::files::{FileSum, FileSumResponse, FileSumResponseType, PathFile};
 use super::{reset_vec_buf, hasher_to_u64s};
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 
 use prost::Message;
 use md5::Digest;
@@ -9,26 +10,30 @@ use crate::var_int_decoder::read_var_int_from_stream;
 
 
 /// Host file or directory at `path` on the socket `addr`
-pub fn host(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow::Result<()> {
+pub fn host(addr: std::net::SocketAddr, path: PathBuf) -> anyhow::Result<()> {
     let sock = std::net::TcpListener::bind(addr)?;
     println!("Bound to socket {addr} and listening!");
 
     for stream in sock.incoming() {
-        handle_client(stream?, path.as_path())?
+        handle_client(stream?, path.clone())?
     }
 
     Ok(())
 }
 
-fn handle_client(mut stream: std::net::TcpStream, path: &std::path::Path) -> anyhow::Result<()> {
+fn handle_client(mut stream: std::net::TcpStream, path: PathBuf) -> anyhow::Result<()> {
     println!("Client connected!");
 
     if path.is_file() {
-        let _bytes_sent = send_file(&mut stream, path)?;
+        let base_path = path.parent().unwrap();  // has to be at least Path("") if it is a file.
+        let file = path.file_name().unwrap();
+        let _bytes_sent = send_file(&mut stream, base_path.to_path_buf(), file.into())?;
         Ok(())
     }
     else if path.is_dir() {
-        todo!()
+        let bytes_sent = send_directory(stream, path)?;
+        println!("Directory fully uploaded {bytes_sent:} Bytes sent.");
+        Ok(())
     }
     else {
         Err(anyhow::Error::msg(format!("Provided Path {path:?} is neither a directory nor a file!")))
@@ -36,33 +41,21 @@ fn handle_client(mut stream: std::net::TcpStream, path: &std::path::Path) -> any
 }
 
 /// Send file at path over stream to client, returns the amount of bytes sent
-fn send_file(stream: &mut std::net::TcpStream, path: &std::path::Path) -> anyhow::Result<u64> {
+fn send_file(stream: &mut std::net::TcpStream, base_path: PathBuf, rel_path: PathBuf) -> anyhow::Result<u64> {
     // open file for reading
+    let mut full_path = base_path.clone();
+    full_path.push(&rel_path);  // add relative path to the base path
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(false)
-        .open(path)?;
-
-    // get file name
-    let file_name = match path.file_name() {
-        Some(name) => match name.to_str() {
-            Some(name) => {
-                name.to_owned()
-            },
-            None => {
-                return Err(anyhow::Error::msg(format!("Path {path:?} has an invalid name!")))
-            }
-        },
-        None => return Err(anyhow::Error::msg(format!("Path {path:?} does not have a name!")))
-    };
+        .open(full_path)?;
 
     // send file message
     let file_size = file.metadata()?.len();
     let path_file = PathFile{
-        rel_path: file_name,
+        rel_path: rel_path.to_string_lossy().into_owned(),  // idc man
         size: file_size,
     };
-    println!("path_file: {path_file:?}, len: {}", path_file.encoded_len());
     stream.write_all(&path_file.encode_length_delimited_to_vec())?;
 
     // create buffer of 64kiB
@@ -87,7 +80,6 @@ fn send_file(stream: &mut std::net::TcpStream, path: &std::path::Path) -> anyhow
 
     // build checksum
     let hash = hasher_to_u64s(hasher);
-    println!("Hash finalized: {hash:x?}");
     let file_sum = FileSum{
         md5_high: hash.high,
         md5_low: hash.low,
@@ -101,7 +93,6 @@ fn send_file(stream: &mut std::net::TcpStream, path: &std::path::Path) -> anyhow
     let mut buf = vec![0; delimiter as usize];
     stream.read_exact(&mut buf)?;
     let response = FileSumResponse::decode(buf.as_slice())?;
-    println!("Received checksum response: {response:?}");
 
     // handle response
     match FileSumResponseType::try_from(response.response)? {
@@ -110,7 +101,59 @@ fn send_file(stream: &mut std::net::TcpStream, path: &std::path::Path) -> anyhow
         },
         // recurse to resend file if no match
         FileSumResponseType::NoMatch => {
-            Ok(file_size + send_file(stream, path)?)
+            Ok(file_size + send_file(stream, base_path, rel_path)?)
         }
     }
+}
+
+
+#[derive(Debug, Clone)]
+enum StackEntry{
+    File { rel_path: PathBuf },
+    Dir { rel_path: PathBuf }
+}
+
+/// Send all files in a directory and all of its descendant directories
+fn send_directory(mut stream: std::net::TcpStream, base_path: PathBuf) -> anyhow::Result<u64> {
+    let mut search_stack = vec![StackEntry::Dir{ rel_path: "".into() }];
+    let mut total_sent = 0;
+
+    while let Some(entry) = search_stack.pop() {
+        match entry {
+            StackEntry::Dir { rel_path } => {
+                explore_directory(&mut search_stack, base_path.clone(), rel_path)?
+            },
+            StackEntry::File { rel_path } => {
+                total_sent += send_file(&mut stream, base_path.clone(), rel_path)?;
+            }
+        }
+    }
+
+    Ok(total_sent)
+}
+
+/// Explore a directory and push all entries onto the stack
+fn explore_directory(stack: &mut Vec<StackEntry>, base_path: PathBuf, rel_path: PathBuf) -> anyhow::Result<()> {
+    // create absolute path of the directory
+    let mut absolute_path = base_path.clone();
+    absolute_path.push(&rel_path);
+
+    // iterate over directory entries
+    for entry in absolute_path.read_dir()?.flatten() {
+        let path = entry.path();
+        // add last path component to rel_path
+        let mut rel_path = rel_path.clone();
+        rel_path.push(path.components().last().unwrap());
+
+        if path.is_dir() {
+            // add new directory to the bottom of the stack
+            stack.insert(0, StackEntry::Dir{ rel_path });
+        }
+        else if path.is_file() {
+            // add new file to the top of the stack
+            stack.push(StackEntry::File { rel_path });
+        }
+    }
+
+    Ok(())
 }

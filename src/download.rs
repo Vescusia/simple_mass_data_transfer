@@ -14,19 +14,19 @@ pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow:
     // the main file_path receiver loop
     while stream.peek(&mut [0; 1])? > 0 {
         // read length
-        let length = read_var_int_from_stream(&mut stream)?;
+        let length = read_var_int_from_stream(&mut stream).unwrap();
         // buffer for PathFile
         let mut buf = vec![0u8; length as usize];
-        stream.read_exact(&mut buf)?;
+        stream.read_exact(&mut buf).unwrap();
 
         // decode PathFile
         let path_file = PathFile::decode(buf.as_slice())?;
 
-        // handle PathFile
-        println!("Received PathFile: size: {}, name: {}", path_file.size, path_file.rel_path);
-        // open file (overwrite if already existing)
+        //println!("Received PathFile: size: {}, name: {}", path_file.size, path_file.rel_path);
+        // create file (overwrite if already existing)
         let mut path = path.clone();
         path.push(path_file.rel_path);
+        std::fs::create_dir_all(path.parent().unwrap())?;  // create all necessary ancestors
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -51,7 +51,6 @@ pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow:
             // write to file and hasher
             file.write_all(buf.as_slice())?;
             hasher.update(buf.as_slice());
-            print!("\r{} out of {} bytes received", bytes_read, path_file.size);
         };
 
         // receive checksum
@@ -66,11 +65,9 @@ pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow:
 
         // handle comparison
         let response = if hashes_match {
-            println!("\nFile {path:?} completely downloaded, hashes match.");
             FileSumResponse{ response: FileSumResponseType::Match.into() }
         }
         else {
-            println!("\nFile {path:?} completely downloaded, hashes did not match. {high:x}:{low:x} != {:x}:{:x} Retrying...", correct_sum.md5_high, correct_sum.md5_low);
             FileSumResponse{ response: FileSumResponseType::NoMatch.into() }
         };
         // send response
@@ -79,5 +76,6 @@ pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow:
     }
 
     // all files downloaded
+    println!("All files downloaded. ");
     Ok(())
 }

@@ -22,8 +22,8 @@ fn main() -> Result<()> {
             if !path.exists() {
                 return Err(Error::msg(format!("Provided Path {path:?} does not exist!")))
             }
-            if path.is_dir() {
-                return Err(Error::msg(format!("Provided Path {path:?} is not a file! Only file uploading is currently supported!")))
+            if !path.is_dir() && !path.is_file() {
+                return Err(Error::msg(format!("Provided Path {path:?} is neither a file not a directory! Only file and directory uploading is currently supported!")))
             }
 
             // sanitize address
