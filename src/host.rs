@@ -3,6 +3,7 @@ use super::{reset_vec_buf, hasher_to_u64s};
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use prost::Message;
 use md5::Digest;
@@ -22,22 +23,28 @@ pub fn host(addr: std::net::SocketAddr, path: PathBuf) -> anyhow::Result<()> {
 }
 
 fn handle_client(mut stream: std::net::TcpStream, path: PathBuf) -> anyhow::Result<()> {
-    println!("Client connected!");
+    println!("Client connected: {:?}", stream.peer_addr());
 
-    if path.is_file() {
+    let now = Instant::now();  // measure upload time!
+    let bytes_sent = if path.is_file() {
+        // host file
         let base_path = path.parent().unwrap();  // has to be at least Path("") if it is a file.
         let file = path.file_name().unwrap();
-        let _bytes_sent = send_file(&mut stream, base_path.to_path_buf(), file.into())?;
-        Ok(())
+        send_file(&mut stream, base_path.to_path_buf(), file.into())?
     }
     else if path.is_dir() {
-        let bytes_sent = send_directory(stream, path)?;
-        println!("Directory fully uploaded {bytes_sent:} Bytes sent.");
-        Ok(())
+        // host directory
+        send_directory(stream, path)?
     }
     else {
-        Err(anyhow::Error::msg(format!("Provided Path {path:?} is neither a directory nor a file!")))
-    }
+        return Err(
+            anyhow::Error::msg(format!("Provided Path {path:?} is neither a directory nor a file!"))
+        );
+    };
+
+    let time_taken = now.elapsed().as_secs();
+    println!("{bytes_sent} Bytes sent in {}s ({:.3} MB/s)", time_taken, (bytes_sent as f64 / 1_000_000.) / time_taken as f64);
+    Ok(())
 }
 
 /// Send file at path over stream to client, returns the amount of bytes sent
