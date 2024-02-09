@@ -7,7 +7,7 @@ pub fn read_var_int_from_stream<S: Read>(stream: &mut S) -> anyhow::Result<u64> 
     // receive bytes (putting into bytes in already big-endian order)
     let mut len = 0u8;
     loop {
-        let byte = take_byte(stream).unwrap();
+        let byte = take_byte(stream)?;
 
         // add byte (minus continuation bit) to bytes
         bytes |= ((byte & 0x7F) as u64) << (len*7);

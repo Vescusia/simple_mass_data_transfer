@@ -1,6 +1,6 @@
 [package]
 name = "simple_mass_data_transfer"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -14,8 +14,10 @@ clap = { version = "^4.4.18", features = ["derive", "suggestions"] }
 clio = "^0.3.5"
 prost = "^0.12.3"
 anyhow = "^1.0.79"
-# We do NOT use md5 for any cryptographic purpose, just to verify hashes of the sended files.
+# just to verify hashes of the sended files.
 md-5 = "^0.10.6"
+# actual cryptography
+magic-crypt = "^3.1.13"
 
 [build-dependencies]
 prost-build = "^0.12.3"

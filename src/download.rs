@@ -1,17 +1,22 @@
 use super::var_int_decoder::read_var_int_from_stream;
-use super::files::{FileSum, FileSumResponse, FileSumResponseType, PathFile};
-use super::{reset_vec_buf, hasher_to_u64s};
+use super::files::{ FileSum, FileSumResponse, FileSumResponseType, PathFile };
+use super::utils::{ reset_vec_buf, hasher_to_u64s };
 
 use std::io::{Read, Write};
 use std::time::Instant;
+use magic_crypt::generic_array::typenum::U131072;
+use magic_crypt::MagicCryptTrait;
 
 use md5::Digest;
 use prost::Message;
 
-pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow::Result<()> {
+pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf, key: Option<String>) -> anyhow::Result<()> {
     // connect to address
     let mut stream = std::net::TcpStream::connect(addr)?;
     println!("Successfully connected to {addr}!");
+
+    // (Maybe) create decryptor
+    let decryptor = key.as_ref().map(|key| magic_crypt::new_magic_crypt!(key, 64));
 
     // scope stdout for good performance writing
     let mut stdout = std::io::stdout();
@@ -30,7 +35,7 @@ pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow:
         stream.read_exact(&mut buf).unwrap();
         // decode PathFile
         let path_file = PathFile::decode(buf.as_slice())?;
-        write!(stdout, "Decoded PathFile.")?;
+        write!(stdout, "Decoded PathFile: {} B", path_file.size)?;
 
         // create file (overwrite if already existing)
         let mut path = path.clone();
@@ -43,7 +48,7 @@ pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow:
         write!(stdout, "\rDownloading File {path:?}")?;
 
         // create buffer of 64kiB
-        let mut buf = Vec::with_capacity(2 << 16);
+        let mut buf = Vec::with_capacity(1 << 16);
         let mut bytes_read = 0;
         // create hasher
         let mut hasher = md5::Md5::new();
@@ -56,10 +61,17 @@ pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow:
             stream.read_exact(&mut buf)?;
             bytes_read += buf.len() as u64;
 
-            // write to file and hasher
-            file.write_all(buf.as_slice())?;
+            // update hasher and user
             hasher.update(buf.as_slice());
-            write!(stdout, "\r{:.3}% received   ", (bytes_read as f64) / (path_file.size as f64) * 100.)?;
+            write!(stdout, "\r{:.3}% received.      ", (bytes_read as f64) / (path_file.size as f64) * 100.)?;
+            std::io::stdout().flush().unwrap();
+
+            // write to file
+            if let Some(encryptor) = &decryptor {
+                encryptor.decrypt_reader_to_writer2::<U131072>(&mut buf.as_slice(), &mut file).unwrap();  // this is weirdly cursed, but works!
+            } else {
+                file.write_all(buf.as_slice())?;
+            }
         };
 
         // receive checksum
@@ -75,11 +87,11 @@ pub fn download(addr: std::net::SocketAddr, path: std::path::PathBuf) -> anyhow:
         // handle comparison
         let time_taken = now.elapsed().as_millis();
         let response = if hashes_match {
-            writeln!(stdout, "\r{path:?} completely downloaded. {}B downloaded in {:.3}s ({:.3} MB/s) Hashes Match.", path_file.size, time_taken as f64 / 1000., (path_file.size as f64 / 1_000_000.) / (time_taken as f64 / 1000.))?;
+            writeln!(stdout, "\r{path:?} completely downloaded. {} B downloaded in {:.3}s ({:.3} MB/s) Hashes Match.", path_file.size, time_taken as f64 / 1000., (path_file.size as f64 / 1_000_000.) / (time_taken as f64 / 1000.))?;
             FileSumResponse{ response: FileSumResponseType::Match.into() }
         }
         else {
-            writeln!(stdout, "\n{path:?} completely downloaded. {}B downloaded in {:.3}s ({:.3} MB/s) Hashes did NOT Match. Retrying...", path_file.size, time_taken as f64 / 1000., (path_file.size as f64 / 1_000_000.) / (time_taken as f64 / 1000.))?;
+            writeln!(stdout, "\n{path:?} completely downloaded. {} B downloaded in {:.3}s ({:.3} MB/s) Hashes did NOT Match. Retrying...", path_file.size, time_taken as f64 / 1000., (path_file.size as f64 / 1_000_000.) / (time_taken as f64 / 1000.))?;
             FileSumResponse{ response: FileSumResponseType::NoMatch.into() }
         };
         // send response

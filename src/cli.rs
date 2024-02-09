@@ -5,7 +5,9 @@ use clap::Parser;
 #[command(propagate_version = true)]
 pub struct Args {
     #[command(subcommand)]
-    pub command: Commands
+    pub command: Commands,
+    #[arg(short('k'), long)]
+    pub pass_key: Option<String>
 }
 
 #[derive(clap::Subcommand, Debug)]

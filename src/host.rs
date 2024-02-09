@@ -1,46 +1,45 @@
-use super::files::{FileSum, FileSumResponse, FileSumResponseType, PathFile};
-use super::{reset_vec_buf, hasher_to_u64s};
+use super::files::{ FileSum, FileSumResponse, FileSumResponseType, PathFile };
+use super::utils::{ reset_vec_buf, hasher_to_u64s };
+use super::var_int_decoder::read_var_int_from_stream;
 
-use std::io::{Read, Write};
+use std::io::{ Read, Write };
 use std::path::PathBuf;
 use std::time::Instant;
 
 use prost::Message;
 use md5::Digest;
-use crate::var_int_decoder::read_var_int_from_stream;
+use magic_crypt::{ MagicCryptTrait, generic_array::typenum::U65536 };
 
 
 /// Host file or directory at `path` on the socket `addr`
-pub fn host(addr: std::net::SocketAddr, path: PathBuf) -> anyhow::Result<()> {
+pub fn host(addr: std::net::SocketAddr, path: PathBuf, key: Option<String>) -> anyhow::Result<()> {
     let sock = std::net::TcpListener::bind(addr)?;
     println!("Bound to socket {addr} and listening!");
 
     for stream in sock.incoming() {
-        handle_client(stream?, path.clone())?
+        handle_client(stream?, path.clone(), key.clone())?
     }
 
     Ok(())
 }
 
-fn handle_client(mut stream: std::net::TcpStream, path: PathBuf) -> anyhow::Result<()> {
+fn handle_client(mut stream: std::net::TcpStream, path: PathBuf, key: Option<String>) -> anyhow::Result<()> {
     println!("Client connected: {:?}", stream.peer_addr());
+    let encryptor = key.as_ref().map(|key| magic_crypt::new_magic_crypt!(key, 64));
 
     let now = Instant::now();  // measure upload time!
     let bytes_sent = if path.is_file() {
         // host file
         let base_path = path.parent().unwrap();  // has to be at least Path("") if it is a file.
         let file = path.file_name().unwrap();
-        send_file(&mut stream, base_path.to_path_buf(), file.into())?
+        send_file(&mut stream, base_path.to_path_buf(), file.into(), encryptor.as_ref())?
     }
     else if path.is_dir() {
         // host directory
-        send_directory(stream, path)?
+        send_directory(stream, path, encryptor.as_ref())?
     }
-    else {
-        return Err(
-            anyhow::Error::msg(format!("Provided Path {path:?} is neither a directory nor a file!"))
-        );
-    };
+    // inputs should already be sanitized anyway
+    else { 0 };
 
     let time_taken = now.elapsed().as_secs();
     println!("{bytes_sent} Bytes sent in {}s ({:.3} MB/s)", time_taken, (bytes_sent as f64 / 1_000_000.) / time_taken as f64);
@@ -48,7 +47,7 @@ fn handle_client(mut stream: std::net::TcpStream, path: PathBuf) -> anyhow::Resu
 }
 
 /// Send file at path over stream to client, returns the amount of bytes sent
-fn send_file(stream: &mut std::net::TcpStream, base_path: PathBuf, rel_path: PathBuf) -> anyhow::Result<u64> {
+fn send_file(stream: &mut std::net::TcpStream, base_path: PathBuf, rel_path: PathBuf, encryptor: Option<&magic_crypt::MagicCrypt64>) -> anyhow::Result<u64> {
     // open file for reading
     let mut full_path = base_path.clone();
     full_path.push(&rel_path);  // add relative path to the base path
@@ -57,8 +56,20 @@ fn send_file(stream: &mut std::net::TcpStream, base_path: PathBuf, rel_path: Pat
         .write(false)
         .open(full_path)?;
 
+    // get file size and maybe calculate in the block size padding
+    let mut file_size = file.metadata()?.len();
+    if encryptor.is_some() {
+        // Align file size to the block size
+        file_size = ((file_size >> 3) + 1) << 3;
+        // Add buffer overhead
+        file_size += (file_size / ((1 << 16) - 8)) << 3;
+        // remove over counting
+        if file_size % ((1 << 16) - 8) == 8 {
+            file_size -= 1 << 3;
+        }
+    }
+
     // send file message
-    let file_size = file.metadata()?.len();
     let path_file = PathFile{
         rel_path: rel_path.to_string_lossy().into_owned(),  // idc man
         size: file_size,
@@ -66,18 +77,29 @@ fn send_file(stream: &mut std::net::TcpStream, base_path: PathBuf, rel_path: Pat
     stream.write_all(&path_file.encode_length_delimited_to_vec())?;
 
     // create buffer of 64kiB
-    let mut buf = Vec::with_capacity(2 << 16);
+    let mut buf = Vec::with_capacity(1 << 16);
     let mut bytes_sent = 0;
     // create hasher
     let mut hasher = md5::Md5::new();
 
     // send file data
     while file_size > bytes_sent {
-        // (re-)initialize buffer
-        reset_vec_buf(&mut buf, (file_size - bytes_sent) as usize);
-
-        // fill buffer
-        file.read_exact(&mut buf)?;
+        // fill buffer (maybe encrypt data)
+        if let Some(encryptor) = encryptor {
+            // clear the vec, as encrypt_reader_to_writer expects
+            buf.clear();
+            // read from file and encrypt into buffer (with 64kiB buffer size - 8 Bytes padding)
+            let mut file = (&file).take((1 << 16) - 8);
+            encryptor.encrypt_reader_to_writer2::<U65536>(&mut file, &mut buf)?;
+            if buf.len() != 1 << 16 && buf.len() as u64 != file_size - bytes_sent {
+                println!("Shit int working! {} <-> {}", buf.len(), file_size - bytes_sent);
+            }
+        }
+        else {
+            // (re-)initialize buffer, as read_exact expects
+            reset_vec_buf(&mut buf, (file_size - bytes_sent) as usize);
+            file.read_exact(&mut buf)?;
+        }
         bytes_sent += buf.len() as u64;
 
         // write buffer to stream and digest it
@@ -108,7 +130,8 @@ fn send_file(stream: &mut std::net::TcpStream, base_path: PathBuf, rel_path: Pat
         },
         // recurse to resend file if no match
         FileSumResponseType::NoMatch => {
-            Ok(file_size + send_file(stream, base_path, rel_path)?)
+            println!("NoMatch received.");
+            Ok(file_size + send_file(stream, base_path, rel_path, encryptor)?)
         }
     }
 }
@@ -121,7 +144,7 @@ enum StackEntry{
 }
 
 /// Send all files in a directory and all of its descendant directories
-fn send_directory(mut stream: std::net::TcpStream, base_path: PathBuf) -> anyhow::Result<u64> {
+fn send_directory(mut stream: std::net::TcpStream, base_path: PathBuf, encryptor: Option<&magic_crypt::MagicCrypt64>) -> anyhow::Result<u64> {
     let mut search_stack = vec![StackEntry::Dir{ rel_path: "".into() }];
     let mut total_sent = 0;
 
@@ -131,7 +154,7 @@ fn send_directory(mut stream: std::net::TcpStream, base_path: PathBuf) -> anyhow
                 explore_directory(&mut search_stack, base_path.clone(), rel_path)?
             },
             StackEntry::File { rel_path } => {
-                total_sent += send_file(&mut stream, base_path.clone(), rel_path)?;
+                total_sent += send_file(&mut stream, base_path.clone(), rel_path, encryptor)?;
             }
         }
     }
@@ -154,7 +177,7 @@ fn explore_directory(stack: &mut Vec<StackEntry>, base_path: PathBuf, rel_path: 
 
         if path.is_dir() {
             // add new directory to the bottom of the stack
-            stack.insert(0, StackEntry::Dir{ rel_path });
+            stack.push(StackEntry::Dir{ rel_path });
         }
         else if path.is_file() {
             // add new file to the top of the stack
