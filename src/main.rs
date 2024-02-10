@@ -1,3 +1,4 @@
+use std::net::ToSocketAddrs;
 use clap::Parser;
 use anyhow::{Result, Error};
 
@@ -44,7 +45,7 @@ fn main() -> Result<()> {
             }
 
             // sanitize address input
-            let addr: std::net::SocketAddr = address.parse()?;
+            let addr: std::net::SocketAddr = address.to_socket_addrs()?.next().unwrap_or_else(|| panic!("Could not parse Socket Address `{address}`."));
 
             download::download(addr, path, args.pass_key)
         }

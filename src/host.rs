@@ -1,5 +1,5 @@
 use super::files::{ FileSum, FileSumResponse, FileSumResponseType, PathFile };
-use super::utils::{ reset_vec_buf, hasher_to_u64s };
+use super::utils::{ reset_vec_buf, DigestWriter };
 use super::var_int_decoder::read_var_int_from_stream;
 
 use std::io::{ Read, Write };
@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use prost::Message;
-use md5::Digest;
 use magic_crypt::{ MagicCryptTrait, generic_array::typenum::U65536 };
 
 
@@ -25,7 +24,7 @@ pub fn host(addr: std::net::SocketAddr, path: PathBuf, key: Option<String>) -> a
 
 fn handle_client(mut stream: std::net::TcpStream, path: PathBuf, key: Option<String>) -> anyhow::Result<()> {
     println!("Client connected: {:?}", stream.peer_addr());
-    let encryptor = key.as_ref().map(|key| magic_crypt::new_magic_crypt!(key, 64));
+    let encryptor = key.as_ref().map(|key| magic_crypt::new_magic_crypt!(key, 128));
 
     let now = Instant::now();  // measure upload time!
     let bytes_sent = if path.is_file() {
@@ -47,7 +46,7 @@ fn handle_client(mut stream: std::net::TcpStream, path: PathBuf, key: Option<Str
 }
 
 /// Send file at path over stream to client, returns the amount of bytes sent
-fn send_file(stream: &mut std::net::TcpStream, base_path: PathBuf, rel_path: PathBuf, encryptor: Option<&magic_crypt::MagicCrypt64>) -> anyhow::Result<u64> {
+fn send_file(stream: &mut std::net::TcpStream, base_path: PathBuf, rel_path: PathBuf, encryptor: Option<&magic_crypt::MagicCrypt128>) -> anyhow::Result<u64> {
     // open file for reading
     let mut full_path = base_path.clone();
     full_path.push(&rel_path);  // add relative path to the base path
@@ -60,55 +59,39 @@ fn send_file(stream: &mut std::net::TcpStream, base_path: PathBuf, rel_path: Pat
     let mut file_size = file.metadata()?.len();
     if encryptor.is_some() {
         // Align file size to the block size
-        file_size = ((file_size >> 3) + 1) << 3;
-        // Add buffer overhead
-        file_size += (file_size / ((1 << 16) - 8)) << 3;
-        // remove over counting
-        if file_size % ((1 << 16) - 8) == 8 {
-            file_size -= 1 << 3;
-        }
+        file_size = ((file_size >> 4) + 1) << 4;
     }
 
     // send file message
+    let rel_path_str = rel_path.to_string_lossy().into_owned();  // Idc man
     let path_file = PathFile{
-        rel_path: rel_path.to_string_lossy().into_owned(),  // idc man
+        rel_path: encryptor.map(|mc| mc.encrypt_str_to_base64(&rel_path_str)).unwrap_or(rel_path_str),  // encrypt rel_path if wanted
         size: file_size,
     };
     stream.write_all(&path_file.encode_length_delimited_to_vec())?;
 
-    // create buffer of 64kiB
-    let mut buf = Vec::with_capacity(1 << 16);
-    let mut bytes_sent = 0;
     // create hasher
-    let mut hasher = md5::Md5::new();
+    let mut writer = DigestWriter::new(stream);
 
     // send file data
-    while file_size > bytes_sent {
-        // fill buffer (maybe encrypt data)
-        if let Some(encryptor) = encryptor {
-            // clear the vec, as encrypt_reader_to_writer expects
-            buf.clear();
-            // read from file and encrypt into buffer (with 64kiB buffer size - 8 Bytes padding)
-            let mut file = (&file).take((1 << 16) - 8);
-            encryptor.encrypt_reader_to_writer2::<U65536>(&mut file, &mut buf)?;
-            if buf.len() != 1 << 16 && buf.len() as u64 != file_size - bytes_sent {
-                println!("Shit int working! {} <-> {}", buf.len(), file_size - bytes_sent);
-            }
-        }
-        else {
+    if let Some(mc) = encryptor {
+        mc.encrypt_reader_to_writer2::<U65536>(&mut file, &mut writer)?;
+    }
+    else {
+        // create buffer of 64kiB
+        let mut buf = Vec::with_capacity(1 << 16);
+        while file_size > writer.bytes_written {
             // (re-)initialize buffer, as read_exact expects
-            reset_vec_buf(&mut buf, (file_size - bytes_sent) as usize);
+            reset_vec_buf(&mut buf, (file_size - writer.bytes_written) as usize);
+            // read from file
             file.read_exact(&mut buf)?;
+            // write buffer to stream and digest it
+            writer.write_all(&buf)?;
         }
-        bytes_sent += buf.len() as u64;
-
-        // write buffer to stream and digest it
-        stream.write_all(&buf)?;
-        hasher.update(buf.as_slice());
     }
 
     // build checksum
-    let hash = hasher_to_u64s(hasher);
+    let (stream, hash) = writer.finalize();
     let file_sum = FileSum{
         md5_high: hash.high,
         md5_low: hash.low,
@@ -144,7 +127,7 @@ enum StackEntry{
 }
 
 /// Send all files in a directory and all of its descendant directories
-fn send_directory(mut stream: std::net::TcpStream, base_path: PathBuf, encryptor: Option<&magic_crypt::MagicCrypt64>) -> anyhow::Result<u64> {
+fn send_directory(mut stream: std::net::TcpStream, base_path: PathBuf, encryptor: Option<&magic_crypt::MagicCrypt128>) -> anyhow::Result<u64> {
     let mut search_stack = vec![StackEntry::Dir{ rel_path: "".into() }];
     let mut total_sent = 0;
 
