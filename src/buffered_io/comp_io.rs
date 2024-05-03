@@ -54,7 +54,7 @@ pub enum PerhapsCompressedWriter<W: Write> {
 impl<W: Write> PerhapsCompressedWriter<W> {
     pub fn compressed(writer: W) -> Self {
         let info = frame::FrameInfo::new()
-            .block_size(frame::BlockSize::Max1MB)
+            .block_size(frame::BlockSize::Max64KB)
             .block_mode(frame::BlockMode::Linked);
         Self::Compressed(frame::FrameEncoder::with_frame_info(info, writer))
     }

@@ -45,11 +45,14 @@ fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: b
     let mut serializer = Serializer::new(&stream);
     let mut deserializer = Deserializer::new(&stream);
 
+    // load resume list from file
+    let mut smd_res_path = rel_path.to_owned(); smd_res_path.push(".smdres");
+    let resume_list = load_resume_list(&smd_res_path)?;
+
     // send handshake
-    // TODO: resume list should be checked from a .smdres file (also note SIZE!!)
     Handshake{
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        resume_list: vec![],
+        resume_list,
         compression
     }.serialize(&mut serializer)?;
 
@@ -67,6 +70,12 @@ fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: b
     );
     
     let mut stdout = io::stdout().lock();
+    
+    // open resume list file
+    let mut smd_res_file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&smd_res_path)?;
     
     // write files
     let mut total_received = 0;
@@ -114,6 +123,8 @@ fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: b
                 if hash.hash == local_hash {
                     stdout.write_all(format!("Hashes match ({local_hash:x}). Total received {}/{}\n", ByteSize(total_received), ByteSize(response.total_size)).as_bytes())?;
                     FileHashResponse{ matches: true }.serialize(&mut serializer)?;
+                    // write hash to smd_res
+                    smd_res_file.write_all(&local_hash.to_ne_bytes())?;
                     break;
                 } else {
                     stdout.write_all(format!("\nHashes do NOT match for file {:?} {local_hash:x} - {:x}!\n", &path, hash.hash).as_bytes())?;
@@ -123,5 +134,28 @@ fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: b
         }
     }
 
+    // delete resume list file after completion
+    std::fs::remove_file(smd_res_path)?;
+    
     Ok(())
+}
+
+
+fn load_resume_list(smd_res_path: &std::path::Path) -> io::Result<Option<std::collections::HashSet<FileHash>>> {
+    // open file
+    let resume_list = match std::fs::read(smd_res_path) {
+        Ok(list) => list,
+        Err(e) => return match e.kind() {
+            io::ErrorKind::NotFound => Ok(None),
+            _ => Err(e)
+        }
+    };
+    
+    // combine bytes into u128's and return
+    let hashes = resume_list.chunks(16)
+        .map(|bytes| u128::from_ne_bytes(*bytes.split_first_chunk::<16>().unwrap().0))
+        .map(|hash| FileHash{hash})
+        .collect::<std::collections::HashSet<FileHash>>();
+    println!("Found ResumeList with {} entries. Size: {}", hashes.len(), ByteSize(hashes.capacity() as u64 * 16));
+    Ok(Some(hashes))
 }

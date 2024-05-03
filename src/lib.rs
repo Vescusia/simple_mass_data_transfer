@@ -17,7 +17,7 @@ pub enum EntryHeader {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct FileHash {
     pub hash: u128
 }
@@ -32,7 +32,7 @@ pub struct FileHashResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Handshake {
     pub version: String,
-    pub resume_list: Vec<EntryHeader>,
+    pub resume_list: Option<std::collections::HashSet<FileHash>>,
     pub compression: bool,
 }
 

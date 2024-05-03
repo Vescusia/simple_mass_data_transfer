@@ -12,12 +12,12 @@ use std::sync::{Arc, RwLock};
 
 use crate::cli::Action;
 use simple_mass_data_transfer::{EntryHeader::{FileHeader, DirHeader}, FileHash, FileHashResponse, Handshake, HandshakeResponse};
-use simple_mass_data_transfer::buffered_io::{HashWriter, PerhapsCompressedWriter, PerhapsEncrWriter, encrypt_io::prepare_key};
-use simple_mass_data_transfer::buffered_io::encrypt_io::maybe_encrypt_path;
+use simple_mass_data_transfer::buffered_io::{PerhapsHashingWriter, PerhapsCompressedWriter, PerhapsEncrWriter, encrypt_io::{prepare_key, maybe_encrypt_path}};
 
 
 type StaticHashmap<K, V> = Lazy<Arc<RwLock<HashMap<K, V>>>>;
-static HASH_CASH: StaticHashmap<std::path::PathBuf, Option<(u128, std::time::SystemTime)>> = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+static HASH_CASH: StaticHashmap<Arc<std::path::PathBuf>, (u128, std::time::SystemTime)> = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+static FILES: Lazy<Arc<RwLock<Vec<Arc<std::path::PathBuf>>>>> = Lazy::new(|| Arc::new(RwLock::new(Vec::new())));
 // TODO: cash file data
 
 
@@ -33,20 +33,19 @@ pub fn serve(args: crate::cli::Args) -> anyhow::Result<()> {
         for path in glob::glob(path)?.filter_map(|p| p.ok()) {
                 // recurse over directories
                 if path.is_dir() {
-                    HASH_CASH.write().unwrap().extend(
+                    FILES.write().unwrap().extend(
                         WalkDir::new(path).into_iter()
                             .filter_map(|p| p.ok())
-                            .map(|p| p.path().to_path_buf())
-                            .map(|p| (p, None))
+                            .map(|p| Arc::new(p.path().to_path_buf()))
                     )
                 } else {
-                    HASH_CASH.write().unwrap().insert(path, None);
+                    FILES.write().unwrap().push(Arc::new(path));
                 }
             }
     }
     
     // calculate total size
-    let total_size: u64 = HASH_CASH.read().unwrap().keys()
+    let total_size: u64 = FILES.read().unwrap().iter()
         .filter(|p| p.is_file())
         .filter_map(|p| p.metadata().ok().map(|p| p.len()))
         .sum();
@@ -98,22 +97,30 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
         compression
     }.serialize(&mut serializer)?;
     
+	let start = std::time::Instant::now();
+	
     // send paths
-    for path in HASH_CASH.read().unwrap().keys() {
+    for path in FILES.read().unwrap().iter() {
         let path_bytes = maybe_encrypt_path(path, &mut encryptor)?;
-        
+        let metadata = path.metadata()?;
+
         // send dir
-        if path.is_dir() {
+        if metadata.is_dir() {
             DirHeader{ path: path_bytes }.serialize(&mut serializer)?;
         }
         // send file
         else { loop {
             // send header
-            let size = path.metadata()?.len();
-            FileHeader{ path: path_bytes.clone(), size }.serialize(&mut serializer)?;
+            FileHeader{ path: path_bytes.clone(), size: metadata.len() }.serialize(&mut serializer)?;
             
+            // check for cached hash
+            let hash = HASH_CASH.read().unwrap().get(path)
+                .filter(|(_, modified)| modified == &metadata.modified().expect("FUCK MAN, why are u using an OS without modified metadata????"))
+                .map(|(h, _)| *h);
+            let precomputed_hash = hash.is_some();
+
             // wrap stream into hasher
-            let writer = HashWriter::new(&stream);
+            let writer = PerhapsHashingWriter::with_hash(&stream, hash);
             // into encryptor
             let writer = PerhapsEncrWriter::with_encryptor(writer, &mut encryptor);
             // and into compressor
@@ -122,18 +129,21 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
             
             // open file
             let mut file = std::fs::OpenOptions::new().read(true)
-                .open(path)?;
+                .open(path.as_path())?;
             // send file
             io::copy(&mut file, &mut writer)?;
             // finish compression
-            // TODO cash hash
             let hasher = writer.finish()?.into_inner();
-            total_sent += hasher.digested;
+            total_sent += hasher.digested();
             
             // send Hash
             let hash = hasher.finalize().1;
             FileHash{ hash }.serialize(&mut serializer)?;
-            
+            // cache hash
+            if !precomputed_hash {
+                HASH_CASH.write().unwrap().insert(path.clone(), (hash, metadata.modified()?));
+            }
+
             // handle response of client
             if FileHashResponse::deserialize(&mut deserializer)?.matches {
                 break
@@ -141,7 +151,8 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
         }}
     }
     
-    println!("Total Sent {} - deflation: {}%", ByteSize(total_sent as u64), (total_sent*100)/(total_size as usize));
+	let time_taken = start.elapsed();
+    println!("Total Sent {} - deflation: {}% in {time_taken:?}", ByteSize(total_sent as u64), (total_sent*100)/(total_size as usize));
     
     Ok(())
 }

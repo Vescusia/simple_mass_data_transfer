@@ -76,3 +76,55 @@ impl<W: Write> Write for HashWriter<W> {
         self.writer.flush()
     }
 }
+
+
+pub enum PerhapsHashingWriter<W: Write> {
+    Hashing(HashWriter<W>),
+    Precomputed{ writer: W, hash: u128, digested: usize }
+}
+
+impl<W: Write> PerhapsHashingWriter<W> {
+    pub fn with_hash(writer: W, hash: Option<u128>) -> Self {
+        if let Some(hash) = hash {
+            Self::Precomputed { writer, hash, digested: 0 }
+        } else {
+            Self::Hashing(HashWriter::new(writer))
+        }
+    }
+
+    pub fn finalize(self) -> (W, u128) {
+        match self {
+            Self::Precomputed { writer, hash, .. } => (writer, hash),
+            Self::Hashing(hasher) => hasher.finalize()
+        }
+    }
+
+    pub fn digested(&self) -> usize {
+        match self {
+            Self::Hashing(hash) => hash.digested,
+            Self::Precomputed { digested, .. } => *digested
+        }
+    }
+}
+
+impl<W: Write> Write for PerhapsHashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Precomputed { writer, digested, .. } => {
+                let written = writer.write(buf);
+                if let Ok(written) = written {
+                    *digested += written;
+                }
+                written
+            },
+            Self::Hashing(hasher) => hasher.write(buf)
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Precomputed { writer, .. } => writer.flush(),
+            Self::Hashing(hasher) => hasher.flush()
+        }
+    }
+}
