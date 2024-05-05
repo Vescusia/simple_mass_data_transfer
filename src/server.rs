@@ -9,45 +9,55 @@ use std::net;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
 
 use crate::cli::Action;
 use simple_mass_data_transfer::{EntryHeader::{FileHeader, DirHeader}, FileHash, FileHashResponse, Handshake, HandshakeResponse};
 use simple_mass_data_transfer::buffered_io::{PerhapsHashingWriter, PerhapsCompressedWriter, PerhapsEncrWriter, encrypt_io::{prepare_key, maybe_encrypt_path}, CountingWriter};
 
 
+// type definitions for simplification
 type StaticHashmap<K, V> = Lazy<Arc<RwLock<HashMap<K, V>>>>;
-static HASH_CASH: StaticHashmap<Arc<std::path::PathBuf>, (u128, std::time::SystemTime)> = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
-static FILES: Lazy<Arc<RwLock<Vec<Arc<std::path::PathBuf>>>>> = Lazy::new(|| Arc::new(RwLock::new(Vec::new())));
-// TODO: cash file data
+type PathVec = Vec<(Arc<PathBuf>, Arc<Path>)>;
+
+// statics
+static HASH_CASH: StaticHashmap<Arc<PathBuf>, (u128, std::time::SystemTime)> = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+static FILES: Lazy<Arc<RwLock<PathVec>>> = Lazy::new(|| Arc::new(RwLock::new(Vec::new())));
 
 
+/// Start serving the `args`
 pub fn serve(args: crate::cli::Args) -> anyhow::Result<()> {
     // TODO: handle relative path!
     // as in, should hosting ./target/files/file.txt 
     // be sent as ./target/files/file.txt or ./file.txt?
     // 
-    // Yeah, HASH_CASH should have both an absolute and relative path.
-    
+    // Yeah, FILES should have both an absolute and relative path.
+
     // collect all files
     if let Action::Host{ path, .. } = &args.action {
         for path in glob::glob(path)?.filter_map(|p| p.ok()) {
-                // recurse over directories
-                if path.is_dir() {
-                    FILES.write().unwrap().extend(
-                        WalkDir::new(path).into_iter()
-                            .filter_map(|p| p.ok())
-                            .map(|p| Arc::new(p.path().to_path_buf()))
-                    )
-                } else {
-                    FILES.write().unwrap().push(Arc::new(path));
-                }
+            let prefix = path.parent().unwrap_or(Path::new("/"));
+            
+            // recurse over directories
+            if path.is_dir() {
+                FILES.write().unwrap().extend(
+                    WalkDir::new(&path).into_iter()
+                        .filter_map(|p| p.ok())
+                        .map(|p| p.path().to_path_buf())
+                        .map(|p| (Arc::new(p.canonicalize().unwrap()), Arc::from(p.strip_prefix(prefix).unwrap())))
+                )
+            } else {
+                FILES.write().unwrap().push(
+                    (Arc::new(path.canonicalize().unwrap()), Arc::from(path.strip_prefix(prefix).unwrap()))
+                );
             }
+        }
     }
     
     // calculate total size
     let total_size: u64 = FILES.read().unwrap().iter()
-        .filter(|p| p.is_file())
-        .filter_map(|p| p.metadata().ok().map(|p| p.len()))
+        .filter(|p| p.0.is_file())
+        .filter_map(|p| p.0.metadata().ok().map(|p| p.len()))
         .sum();
     println!("total size: {}", ByteSize(total_size));
         
@@ -87,6 +97,7 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
     }
     let compression = compression | handshake.compression;
     
+    // create encryptor
     let mut encryptor = key.as_ref().as_ref().map(|key|
         chacha20poly1305::ChaCha20Poly1305::new(&prepare_key(key))
     );
@@ -100,10 +111,10 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
 	let start = std::time::Instant::now();
 	
     // send paths
-    for path in FILES.read().unwrap().iter() {
-        let path_bytes = maybe_encrypt_path(path, &mut encryptor)?;
-        let metadata = path.metadata()?;
-
+    for (abs_path, rel_path) in FILES.read().unwrap().iter() {
+        let path_bytes = maybe_encrypt_path(rel_path, &mut encryptor)?;
+        let metadata = abs_path.metadata()?;
+ 
         // send dir
         if metadata.is_dir() {
             DirHeader{ path: path_bytes }.serialize(&mut serializer)?;
@@ -111,7 +122,7 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
         // send file
         else { loop {
             // check for cached hash
-            let hash = HASH_CASH.read().unwrap().get(path)
+            let hash = HASH_CASH.read().unwrap().get(abs_path)
                 .filter(|(_, modified)| modified == &metadata.modified().expect("FUCK MAN, why are u using an OS without modified metadata????"))
                 .map(|(h, _)| *h);
             let precomputed_hash = hash.is_some();
@@ -137,7 +148,7 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
             
             // open file
             let mut file = std::fs::OpenOptions::new().read(true)
-                .open(path.as_path())?;
+                .open(abs_path.as_path())?;
             // send file
             io::copy(&mut file, &mut writer)?;
 
@@ -150,7 +161,7 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
             FileHash{ hash }.serialize(&mut serializer)?;
             // cache hash
             if !precomputed_hash {
-                HASH_CASH.write().unwrap().insert(path.clone(), (hash, metadata.modified()?));
+                HASH_CASH.write().unwrap().insert(abs_path.clone(), (hash, metadata.modified()?));
             }
 
             // handle response of client

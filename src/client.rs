@@ -83,14 +83,12 @@ fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: b
         // receive header
         match EntryHeader::deserialize(&mut deserializer)? {
             DirHeader{ path: extend_path } => {
-                let mut path = rel_path.clone(); 
-                path.push(maybe_decrypt_path(extend_path, &mut decryptor)?);
-                std::fs::create_dir_all(&path)?;
+                let path = rel_path.join(maybe_decrypt_path(extend_path, &mut decryptor)?);
+                std::fs::create_dir_all(path)?;
             },
             FileHeader{ path: extend_path, size } => loop {
                 // decrypt and build path
-                let mut path = rel_path.clone(); 
-                path.push(maybe_decrypt_path(extend_path.clone(), &mut decryptor)?);
+                let path = rel_path.join(maybe_decrypt_path(extend_path.clone(), &mut decryptor)?);
                 stdout.write_all(format!("Received FileHeader {path:?} with {}\n", ByteSize(size)).as_bytes())?;
 
                 // open file
