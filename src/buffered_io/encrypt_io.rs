@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 
 pub fn prepare_key<S: AsRef<str>>(key: S) -> Key {
+    // hash the key to 64 B length
     let mut digester = sha2::Sha512::new();
     digester.update(key.as_ref());
     let hash = digester.finalize();

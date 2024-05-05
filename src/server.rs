@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::cli::Action;
 use simple_mass_data_transfer::{EntryHeader::{FileHeader, DirHeader}, FileHash, FileHashResponse, Handshake, HandshakeResponse};
-use simple_mass_data_transfer::buffered_io::{PerhapsHashingWriter, PerhapsCompressedWriter, PerhapsEncrWriter, encrypt_io::{prepare_key, maybe_encrypt_path}};
+use simple_mass_data_transfer::buffered_io::{PerhapsHashingWriter, PerhapsCompressedWriter, PerhapsEncrWriter, encrypt_io::{prepare_key, maybe_encrypt_path}, CountingWriter};
 
 
 type StaticHashmap<K, V> = Lazy<Arc<RwLock<HashMap<K, V>>>>;
@@ -110,34 +110,43 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
         }
         // send file
         else { loop {
-            // send header
-            FileHeader{ path: path_bytes.clone(), size: metadata.len() }.serialize(&mut serializer)?;
-            
             // check for cached hash
             let hash = HASH_CASH.read().unwrap().get(path)
                 .filter(|(_, modified)| modified == &metadata.modified().expect("FUCK MAN, why are u using an OS without modified metadata????"))
                 .map(|(h, _)| *h);
             let precomputed_hash = hash.is_some();
 
-            // wrap stream into hasher
-            let writer = PerhapsHashingWriter::with_hash(&stream, hash);
-            // into encryptor
-            let writer = PerhapsEncrWriter::with_encryptor(writer, &mut encryptor);
-            // and into compressor
-            let mut writer = PerhapsCompressedWriter::with_compression(writer, compression);
+            // check in Resume List
+            if let Some(hash) = hash {
+                if let Some(resume_list) = &handshake.resume_list {
+                    if resume_list.get(&hash.into()).is_some() {
+                        break
+                    }
+                }
+            }
             
+            // send header
+            FileHeader{ path: path_bytes.clone(), size: metadata.len() }.serialize(&mut serializer)?;
+
+            // wrap stream into Byte counter and encryptor
+            let writer = PerhapsEncrWriter::with_encryptor(CountingWriter::new(&stream), &mut encryptor);
+            // into compressor
+            let writer = PerhapsCompressedWriter::with_compression(writer, compression);
+            // and into hasher
+            let mut writer = PerhapsHashingWriter::with_hash(writer, hash);
             
             // open file
             let mut file = std::fs::OpenOptions::new().read(true)
                 .open(path.as_path())?;
             // send file
             io::copy(&mut file, &mut writer)?;
-            // finish compression
-            let hasher = writer.finish()?.into_inner();
-            total_sent += hasher.digested();
+
+            // get hash
+            let (compressor, hash) = writer.finalize();
+            // finish compression and add sent bytes
+            total_sent += compressor.finish()?.into_inner().written;
             
             // send Hash
-            let hash = hasher.finalize().1;
             FileHash{ hash }.serialize(&mut serializer)?;
             // cache hash
             if !precomputed_hash {

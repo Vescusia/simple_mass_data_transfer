@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "simple_mass_data_transfer"
-version = "2.1.0"
+version = "2.1.2"
 dependencies = [
  "anyhow",
  "bytesize",

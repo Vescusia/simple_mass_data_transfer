@@ -92,10 +92,6 @@ fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: b
                 let mut path = rel_path.clone(); 
                 path.push(maybe_decrypt_path(extend_path.clone(), &mut decryptor)?);
                 stdout.write_all(format!("Received FileHeader {path:?} with {}\n", ByteSize(size)).as_bytes())?;
-                // create parent folder(s)
-                if let Some(p) = path.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
 
                 // open file
                 let mut file = std::fs::OpenOptions::new()
@@ -103,30 +99,30 @@ fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: b
                     .create(true)
                     .truncate(true)
                     .open(&path)?;
-
-                // wrap file hasher
-                let reader = HashReader::new(&stream);
+                
                 // wrap file into decryptor
-                let reader = PerhapsEncrReader::with_decryptor(reader, &mut decryptor);
-                // wrap file into decompressor
-                let mut reader = PerhapsCompressedReader::with_compression(reader, compression, size);
+                let reader = PerhapsEncrReader::with_decryptor(&stream, &mut decryptor);
+                // into decompressor
+                let reader = PerhapsCompressedReader::with_compression(reader, compression, size);
+                // and into hasher
+                let mut reader = HashReader::new(reader);
                 
                 // write
                 total_received += io::copy(&mut reader, &mut file).unwrap();
 
-                // calculate hash
-                let local_hash = reader.into_inner()
-                    .into_inner()
-                    .finalize().1;
-                // compare hashes
+                // calculate and receive both hashes 
+                let (_, local_hash) = reader.finalize();
                 let hash = FileHash::deserialize(&mut deserializer)?;
+                
+                // compare hashes
                 if hash.hash == local_hash {
                     stdout.write_all(format!("Hashes match ({local_hash:x}). Total received {}/{}\n", ByteSize(total_received), ByteSize(response.total_size)).as_bytes())?;
                     FileHashResponse{ matches: true }.serialize(&mut serializer)?;
                     // write hash to smd_res
                     smd_res_file.write_all(&local_hash.to_ne_bytes())?;
                     break;
-                } else {
+                } 
+                else {
                     stdout.write_all(format!("\nHashes do NOT match for file {:?} {local_hash:x} - {:x}!\n", &path, hash.hash).as_bytes())?;
                     FileHashResponse{ matches: false }.serialize(&mut serializer)?;
                 }

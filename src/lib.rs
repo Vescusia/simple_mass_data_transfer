@@ -44,3 +44,10 @@ pub struct HandshakeResponse {
     pub total_size: u64,
     pub compression: bool,
 }
+
+
+impl From<u128> for FileHash {
+    fn from(hash: u128) -> Self {
+        Self{ hash }
+    }
+}

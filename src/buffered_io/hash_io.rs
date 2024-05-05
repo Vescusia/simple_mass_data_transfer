@@ -6,8 +6,6 @@ use md5::{Digest, Md5};
 pub struct HashReader<R: Read> {
     reader: R,
     hasher: Md5,
-    /// total bytes digested
-    pub digested: usize,
 }
 
 impl<R: Read> HashReader<R> {
@@ -15,12 +13,11 @@ impl<R: Read> HashReader<R> {
         Self{
             reader,
             hasher: Md5::new(),
-            digested: 0
         }
     }
 
     pub fn finalize(self) -> (R, u128) {
-        (self.reader, u128::from_le_bytes(
+        (self.reader, u128::from_be_bytes(
             *self.hasher.finalize().split_first_chunk::<16>().unwrap().0)
         )
     }
@@ -31,7 +28,6 @@ impl<R: Read> Read for HashReader<R> {
         let bytes_read = self.reader.read(buf);
         if let Ok(br) = bytes_read {
             self.hasher.update(&buf[..br]);
-            self.digested += br;
         }
         bytes_read
     }
@@ -42,8 +38,6 @@ impl<R: Read> Read for HashReader<R> {
 pub struct HashWriter<W: Write> {
     writer: W,
     hasher: Md5,
-    /// total bytes digested
-    pub digested: usize,
 }
 
 impl<W: Write> HashWriter<W> {
@@ -51,12 +45,11 @@ impl<W: Write> HashWriter<W> {
         Self{
             writer,
             hasher: Md5::new(),
-            digested: 0
         }
     }
 
     pub fn finalize(self) -> (W, u128) {
-        (self.writer, u128::from_le_bytes(
+        (self.writer, u128::from_be_bytes(
             *self.hasher.finalize().split_first_chunk::<16>().unwrap().0)
         )
     }
@@ -67,7 +60,6 @@ impl<W: Write> Write for HashWriter<W> {
         let written = self.writer.write(buf);
         if let Ok(bw) = written {
             self.hasher.update(&buf[0..bw]);
-            self.digested += bw;
         }
         written
     }
@@ -78,6 +70,7 @@ impl<W: Write> Write for HashWriter<W> {
 }
 
 
+#[derive(Debug)]
 pub enum PerhapsHashingWriter<W: Write> {
     Hashing(HashWriter<W>),
     Precomputed{ writer: W, hash: u128, digested: usize }
@@ -96,13 +89,6 @@ impl<W: Write> PerhapsHashingWriter<W> {
         match self {
             Self::Precomputed { writer, hash, .. } => (writer, hash),
             Self::Hashing(hasher) => hasher.finalize()
-        }
-    }
-
-    pub fn digested(&self) -> usize {
-        match self {
-            Self::Hashing(hash) => hash.digested,
-            Self::Precomputed { digested, .. } => *digested
         }
     }
 }
