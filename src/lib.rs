@@ -1,6 +1,8 @@
 use serde::{Serialize, Deserialize};
 
 pub mod buffered_io;
+pub mod event_handler;
+pub mod cli;
 
 
 #[derive(Debug, Serialize, Deserialize)]

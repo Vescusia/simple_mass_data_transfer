@@ -1,8 +1,9 @@
 use clap::Parser;
 
-mod cli;
 mod server;
 mod client;
+mod cli;
+mod ui;
 
 
 fn main() -> anyhow::Result<()> {
@@ -13,7 +14,8 @@ fn main() -> anyhow::Result<()> {
         
         match args.action {
             cli::Action::Download{ .. } => {
-                client::connect(args)?
+                let (tx, rx) = std::sync::mpsc::channel();
+                client::connect(args, tx)?
             },
             cli::Action::Host{ .. } => {
                 server::serve(args)?
@@ -21,7 +23,12 @@ fn main() -> anyhow::Result<()> {
         }
     }
     else {
-        println!("GUI not yet supported! Please use -h to access the CLI-Help!")
+        println!("GUI not yet supported! Please use -h to access the CLI-Help!");
+        eframe::run_native(
+            "SMD-Client", 
+            eframe::NativeOptions::default(), 
+            Box::new(|_cc| Box::<ui::client_ui::ClientUi>::default())
+        ).expect("Could not create GUI.");
     }
     
     Ok(())

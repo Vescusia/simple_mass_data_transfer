@@ -31,4 +31,10 @@ hex = "^0.4.3"
 chacha20poly1305 = "^0.10.1"
 sha2 = "^0.10.2"
 # compression
+# TODO: zstd. (https://manishrjain.com/compression-algo-moving-data)
 lz4_flex = "^0.11.3"
+# ui
+egui = "^0.27.2"
+eframe = "^0.27.2"
+tinyfiledialogs = "^3.9.1"
+regex = "^1.10.4"
