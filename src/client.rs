@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 use crate::cli;
 use simple_mass_data_transfer::{Handshake, HandshakeResponse, FileHash, EntryHeader::{FileHeader, DirHeader}, EntryHeader, FileHashResponse};
 use simple_mass_data_transfer::buffered_io::{HashReader, PerhapsCompressedReader, PerhapsEncrReader, encrypt_io::{prepare_key, maybe_decrypt_path}};
-use simple_mass_data_transfer::event_handler::{ClientEvent, ClientEventReader};
+use simple_mass_data_transfer::client_events::{ClientEvent, ClientEventReader};
 
 
 pub fn connect(args: cli::Args, handler: Sender<ClientEvent>) -> anyhow::Result<()> {
@@ -25,7 +25,6 @@ pub fn connect(args: cli::Args, handler: Sender<ClientEvent>) -> anyhow::Result<
         // if the path does not exist, create it
         else if !p.exists() {
             std::fs::create_dir_all(&p)?;
-            println!("Created {p:?}.");
         }
 
         p
@@ -35,7 +34,6 @@ pub fn connect(args: cli::Args, handler: Sender<ClientEvent>) -> anyhow::Result<
     let stream = if let cli::Action::Download { address, .. } = &args.action {
         net::TcpStream::connect(address)?
     } else { panic!("This should not happen?") };
-    println!("Connected to server: {:?}", stream.peer_addr()?);
 
     download(stream, rel_path, args.compression, args.encryption_key, handler)?;
 

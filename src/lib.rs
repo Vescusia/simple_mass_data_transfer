@@ -1,7 +1,7 @@
 use serde::{Serialize, Deserialize};
 
 pub mod buffered_io;
-pub mod event_handler;
+pub mod client_events;
 pub mod cli;
 
 

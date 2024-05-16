@@ -172,7 +172,8 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
     }
     
 	let time_taken = start.elapsed();
-    println!("Total Sent {} - deflation: {}% in {time_taken:?}", ByteSize(total_sent as u64), (total_sent*100)/(total_size as usize));
+    println!("Total Sent {} - deflation: {}%", ByteSize(total_sent as u64), (total_sent*100)/(total_size as usize));
+    println!("{} in {time_taken:?}", ByteSize(total_size));
     
     Ok(())
 }

@@ -1,4 +1,4 @@
-use simple_mass_data_transfer::event_handler::ClientEvent;
+use simple_mass_data_transfer::client_events::ClientEvent;
 use crate::cli::Args;
 
 use eframe::Frame;
@@ -147,14 +147,14 @@ impl eframe::App for ClientUi {
 				ui.separator();
 				
 				// Connect Button
-				let button = egui::Button::new(match (super::validate_socket_address(&self.address), self.path.is_some()) {
+				let button = egui::Button::new(match (validate_socket_address(&self.address), self.path.is_some()) {
 					(true, true) => "Connect",
 					(false, true) => "Enter a valid Socket Address!",
 					(true, false) => "Select a valid Download Path!",
 					(false, false) => "Enter valid Socket Address Select and Download Path!"
 				});
 				// only enabled when address and path is some
-				if ui.add_enabled(super::validate_socket_address(&self.address) && self.path.is_some(), button).clicked() {
+				if ui.add_enabled(validate_socket_address(&self.address) && self.path.is_some(), button).clicked() {
 					// build args
 					let args = Args{
 						action: crate::cli::Action::Download {
@@ -253,5 +253,18 @@ impl eframe::App for ClientUi {
 					});
 			});
 		}
+    }
+}
+
+
+/// Roughly validate a socket address string, without checking if domain exists.
+fn validate_socket_address(address: &str) -> bool {
+    let re = regex::Regex::new(
+        r"(([a-z]+\.)?[a-z]+(\.[a-z]+)?:[0-9]+)|([0-9]{3}\.[0-9]{3}\.[0-9]{3}\.[0-9]{3}:[0-9]+)"
+    ).unwrap();
+    
+    match re.captures(address) {
+        Some(c) => &c[0] == address,
+        None => false
     }
 }
