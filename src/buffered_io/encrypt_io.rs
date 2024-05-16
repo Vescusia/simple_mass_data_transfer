@@ -3,7 +3,7 @@ use chacha20poly1305::aead::{ OsRng };
 use sha2::digest::Digest;
 
 use std::cmp::min;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 
@@ -152,19 +152,28 @@ impl<'a, R: Read> PerhapsEncrReader<'a, R> {
     }
 }
 
-impl<'a, R: Read> Read for PerhapsEncrReader<'a, R> {
+impl<'a, R: Read + BufRead> Read for PerhapsEncrReader<'a, R> {
+    /// This is pretty bad,
+    /// if possible, use the [`BufRead`] interface (✿◡‿◡)
     fn read(&mut self, dist_buf: &mut [u8]) -> std::io::Result<usize> {
+        let data = self.fill_buf()?;
+        let to_copy = min(dist_buf.len(), data.len());
+        let (left, _) = dist_buf.split_at_mut(to_copy);
+        
+        left.copy_from_slice(&data[..to_copy]);
+        self.consume(to_copy);
+        Ok(to_copy)
+    }
+}
+
+impl<'a, R: Read + BufRead> BufRead for PerhapsEncrReader<'a, R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         match self {
-            Self::Plain(r) => r.read(dist_buf),
+            Self::Plain(r) => r.fill_buf(),
             Self::Encrypted { buffer, decryptor, reader, already_read } => {
                 // if there are some residuals...
                 if *already_read < buffer.len() {
-                    // calculate the amount of bytes we will read into the distant buffer
-                    let bytes_read = min(dist_buf.len(), buffer.len() - *already_read);
-                    // copy from already decrypted buffer into distant buffer
-                    dist_buf.copy_from_slice(&buffer[*already_read..*already_read+bytes_read]);
-                    *already_read += bytes_read;
-                    Ok(bytes_read)
+                    Ok(&buffer[*already_read..buffer.len()])
                 }
                 // get and decrypt more bytes from reader
                 else {
@@ -181,13 +190,22 @@ impl<'a, R: Read> Read for PerhapsEncrReader<'a, R> {
                     // decrypt into buffer
                     buffer.resize_with(length, || 0);
                     reader.read_exact(buffer)?;
-                    decryptor.decrypt_in_place(&nonce, b"", buffer).expect("If this fails, you are probably using a wrong decryption key!!");
+                    if decryptor.decrypt_in_place(&nonce, b"", buffer).is_err() {
+                        // this error's, when a wrong encryption key is used
+                        return Err(std::io::Error::other("Wrong encryption key used!"))
+                    }
                     *already_read = 0;
 
-                    // read
-                    self.read(dist_buf)
+                    Ok(&buffer[..])
                 }
             }
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        match self {
+            Self::Plain(r) => r.consume(amt),
+            Self::Encrypted { already_read, .. } => *already_read += amt
         }
     }
 }

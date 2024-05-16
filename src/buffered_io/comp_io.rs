@@ -1,42 +1,30 @@
-use std::io::{Read, Write};
-use lz4_flex::frame;
+use std::io::{BufRead, Read, Write};
+use zstd::{Decoder, Encoder};
 
-#[derive(Debug)]
-pub enum PerhapsCompressedReader<R: Read> {
-    Compressed(frame::FrameDecoder<R>),
-    UnCompressed(std::io::Take<R>)
+
+pub enum PerhapsCompressedReader<'a, R: BufRead> {
+    Compressed(Decoder<'a, R>),
+    UnCompressed(R)
 }
 
-impl<R: Read> PerhapsCompressedReader<R> {
-    /// This does not need a total amount of bytes read,
-    /// as lz4 does that internally.
-    pub fn compressed(reader: R) -> Self {
-        Self::Compressed(frame::FrameDecoder::new(reader))
-    }
-
-    /// Use uncompressed reader, 
-    /// with the total amount of bytes that are to be read
-    pub fn uncompressed(reader: R, total_bytes: u64) -> Self {
-        Self::UnCompressed(reader.take(total_bytes))
-    }
-    
+impl<'a, R: BufRead> PerhapsCompressedReader<'a, R> {
     pub fn into_inner(self) -> R {
         match self {
-            Self::Compressed(decoder) => decoder.into_inner(),
-            Self::UnCompressed(r) => r.into_inner()
+            Self::Compressed(decoder) => decoder.finish(),
+            Self::UnCompressed(r) => r
         }
     }
     
-    pub fn with_compression(reader: R, comp: bool, total_bytes: u64) -> Self {
+    pub fn with_compression(reader: R, comp: bool) -> Self {
         if comp {
-            Self::compressed(reader)
+            Self::Compressed(Decoder::with_buffer(reader).unwrap())
         } else {
-            Self::uncompressed(reader, total_bytes)
+            Self::UnCompressed(reader)
         }
     }
 }
 
-impl<R: Read> Read for PerhapsCompressedReader<R> {
+impl<'a, R: BufRead> Read for PerhapsCompressedReader<'a, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Compressed(decoder) => decoder.read(buf),
@@ -45,24 +33,13 @@ impl<R: Read> Read for PerhapsCompressedReader<R> {
     }
 }
 
-#[derive(Debug)]
-pub enum PerhapsCompressedWriter<W: Write> {
-    Compressed(frame::FrameEncoder<W>),
+
+pub enum PerhapsCompressedWriter<'a, W: Write> {
+    Compressed(Encoder<'a, W>),
     UnCompressed(W)
 }
 
-impl<W: Write> PerhapsCompressedWriter<W> {
-    pub fn compressed(writer: W) -> Self {
-        let info = frame::FrameInfo::new()
-            .block_size(frame::BlockSize::Max64KB)
-            .block_mode(frame::BlockMode::Linked);
-        Self::Compressed(frame::FrameEncoder::with_frame_info(info, writer))
-    }
-
-    pub fn uncompressed(writer: W) -> Self {
-        Self::UnCompressed(writer)
-    }
-
+impl<'a, W: Write> PerhapsCompressedWriter<'a, W> {
     pub fn finish(self) -> anyhow::Result<W> {
         Ok(match self {
             Self::Compressed(encoder) => encoder.finish()?,
@@ -70,16 +47,16 @@ impl<W: Write> PerhapsCompressedWriter<W> {
         })
     }
     
-    pub fn with_compression(writer: W, comp: bool) -> Self {
+    pub fn with_compression(writer: W, comp: bool, level: u8) -> Self {
         if comp {
-            Self::compressed(writer)
+            Self::Compressed(Encoder::new(writer, level as i32).unwrap())
         } else {
-            Self::uncompressed(writer)
+            Self::UnCompressed(writer)
         }
     }
 }
 
-impl<W: Write> Write for PerhapsCompressedWriter<W> {
+impl<'a, W: Write> Write for PerhapsCompressedWriter<'a, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Compressed(encoder) => { encoder.write(buf) },
