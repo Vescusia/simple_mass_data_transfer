@@ -1,4 +1,4 @@
-use std::io::{Write};
+use std::io::{BufRead, Read, Write};
 use rmp_serde::{Serializer, Deserializer};
 use serde::{Deserialize, Serialize};
 use chacha20poly1305::KeyInit;
@@ -41,9 +41,11 @@ pub fn connect(args: cli::Args, handler: Sender<ClientEvent>) -> anyhow::Result<
 }
 
 fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: bool, key: Option<String>, handler: Sender<ClientEvent>) -> anyhow::Result<()> {
-    let mut serializer = Serializer::new(&stream);
-    let mut deserializer = Deserializer::new(&stream);
-
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+    
+    let mut serializer = Serializer::new(stream.try_clone()?);
+    let mut deserializer = Deserializer::new(io::BufReader::new(stream));
+    
     // load resume list from file
     let mut smd_res_path = rel_path.to_owned(); smd_res_path.push(".smdres");
     let resume_list = load_resume_list(&smd_res_path)?;
@@ -77,7 +79,8 @@ fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: b
     
     // write files
     let start = std::time::Instant::now();
-    while stream.peek(&mut [0])? > 0 {
+    
+    while !deserializer.get_mut().fill_buf()?.is_empty() {
         // receive header
         match EntryHeader::deserialize(&mut deserializer)? {
             DirHeader{ path: extend_path } => {
@@ -97,16 +100,16 @@ fn download(stream: net::TcpStream, rel_path: std::path::PathBuf, compression: b
                     .open(&rel_path.join(path))?;
                 
                 // wrap file into decryptor
-                let reader = PerhapsEncrReader::with_decryptor(&stream, &mut decryptor);
+                let reader = PerhapsEncrReader::with_decryptor(deserializer.get_mut(), &mut decryptor);
                 // into decompressor
-                let reader = PerhapsCompressedReader::with_compression(reader, compression, size);
+                let reader = PerhapsCompressedReader::with_compression(reader, compression);
                 // into hasher
                 let reader = HashReader::new(reader);
                 // and into message sender
                 let mut reader = ClientEventReader::new(reader, &handler);
-                
-                // write
-                io::copy(&mut reader, &mut file)?;
+                    
+                // write size amount of bytes to file
+                io::copy(&mut (&mut reader).take(size), &mut file)?;
 
                 // calculate and receive both hashes 
                 let (_, local_hash) = reader.inner().finalize();

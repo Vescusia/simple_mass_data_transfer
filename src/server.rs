@@ -27,12 +27,11 @@ static FILES: Lazy<Arc<RwLock<PathVec>>> = Lazy::new(|| Arc::new(RwLock::new(Vec
 
 /// Start serving the `args`
 pub fn serve(args: crate::cli::Args) -> anyhow::Result<()> {
-    // TODO: handle relative path!
-    // as in, should hosting ./target/files/file.txt 
-    // be sent as ./target/files/file.txt or ./file.txt?
-    // 
-    // Yeah, FILES should have both an absolute and relative path.
-
+    // extract compression level
+    let comp_level = if let Action::Host { comp_level, .. } = args.action {
+        comp_level
+    } else { panic!("this should not happen") };
+    
     // collect all files
     if let Action::Host{ path, .. } = &args.action {
         for path in glob::glob(path)?.filter_map(|p| p.ok()) {
@@ -60,7 +59,6 @@ pub fn serve(args: crate::cli::Args) -> anyhow::Result<()> {
         .filter_map(|p| p.0.metadata().ok().map(|p| p.len()))
         .sum();
     println!("total size: {}", ByteSize(total_size));
-        
 
     // create listener
     let listener = if let Action::Host { bind_address, .. } = &args.action {
@@ -78,12 +76,12 @@ pub fn serve(args: crate::cli::Args) -> anyhow::Result<()> {
         
         // start handle thread
         let key = key.clone();
-        std::thread::spawn(move || { handle_client(client, args.compression, total_size, key) });
+        std::thread::spawn(move || { handle_client(client, args.compression, total_size, key, comp_level) });
     }
 }
 
 
-fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key: Arc<Option<String>>) -> anyhow::Result<()> {
+fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key: Arc<Option<String>>, comp_level: u8) -> anyhow::Result<()> {
     let mut deserializer = Deserializer::new(&stream);
     let mut serializer = Serializer::new(&stream);
     let mut total_sent = 0;
@@ -108,9 +106,8 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
         compression
     }.serialize(&mut serializer)?;
     
-	let start = std::time::Instant::now();
-	
-    // send paths
+    // main loop
+    let start = std::time::Instant::now();
     for (abs_path, rel_path) in FILES.read().unwrap().iter() {
         let path_bytes = maybe_encrypt_path(rel_path, &mut encryptor)?;
         let metadata = abs_path.metadata()?;
@@ -142,7 +139,7 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
             // wrap stream into Byte counter and encryptor
             let writer = PerhapsEncrWriter::with_encryptor(CountingWriter::new(&stream), &mut encryptor);
             // into compressor
-            let writer = PerhapsCompressedWriter::with_compression(writer, compression);
+            let writer = PerhapsCompressedWriter::with_compression(writer, compression, comp_level);
             // and into hasher
             let mut writer = PerhapsHashingWriter::with_hash(writer, hash);
             
@@ -173,7 +170,7 @@ fn handle_client(stream: net::TcpStream, compression: bool, total_size: u64, key
     
 	let time_taken = start.elapsed();
     println!("Total Sent {} - deflation: {}%", ByteSize(total_sent as u64), (total_sent*100)/(total_size as usize));
-    println!("{} in {time_taken:?}", ByteSize(total_size));
+    println!("{} in {time_taken:?} ({}/s)", ByteSize(total_size), ByteSize(total_size / time_taken.as_secs()));
     
     Ok(())
 }

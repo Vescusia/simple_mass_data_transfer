@@ -15,7 +15,7 @@ pub struct Args {
     #[arg(short('k'), long)]
     pub encryption_key: Option<String>,
     
-    /// Should the traffic be compressed? (lz4)
+    /// Should the traffic be compressed? (zstd)
     #[arg(short, long, default_value_t = false)]
     pub compression: bool,
 } 
@@ -33,6 +33,15 @@ pub enum Action {
         /// Also supports wildcards, like '*'!
         #[arg()]
         path: String,
+
+        /// The level of zstd compression that should be used.
+        /// Should be between 1 and 22. 
+        /// 
+        /// Compression speed generally goes from ~300 MB/s at level 1 to ~2.5 MB/s at level 22.
+        /// You can choose a compression level that decently matches **twice** your upload speed
+        /// or use the default for ~15 MB/s (~twice my upload speed :D).
+        #[arg(short('l'), long, default_value_t = 15, value_parser = clap::value_parser!(u8).range(1..22))]
+        comp_level: u8
     },
     
     /// Download from a Hoster
