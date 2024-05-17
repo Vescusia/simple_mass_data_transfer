@@ -45,7 +45,10 @@ pub fn maybe_decrypt_path(mut path_bytes: Vec<u8>, decryptor: &mut Option<ChaCha
 
         // decrypt rest
         path_bytes.truncate(path_bytes.len()-12);
-        decryptor.decrypt_in_place(&nonce, b"", &mut path_bytes).expect("\nYou are using encryption with the wrong key!\n");
+        if decryptor.decrypt_in_place(&nonce, b"", &mut path_bytes).is_err() {
+            // this error's, when a wrong encryption key is used
+            anyhow::bail!("Wrong encryption key used!")
+        }
         path_bytes
     }
     else {

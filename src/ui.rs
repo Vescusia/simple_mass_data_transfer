@@ -59,8 +59,8 @@ impl Default for ClientUi {
 impl eframe::App for ClientUi {
     fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
 		// display all popup messages
-		for (text, open) in self.popup.iter_mut() {
-			egui::Window::new("Alert")
+		for (i, (text, open)) in self.popup.iter_mut().enumerate() {
+			egui::Window::new(format!("Alert - {i}"))
 				.collapsible(false)
 				.resizable(true)
 				.open(open)
@@ -153,8 +153,10 @@ impl eframe::App for ClientUi {
 					(true, false) => "Select a valid Download Path!",
 					(false, false) => "Enter valid Socket Address Select and Download Path!"
 				});
+				
 				// only enabled when address and path is some
-				if ui.add_enabled(validate_socket_address(&self.address) && self.path.is_some(), button).clicked() {
+				let inputs_valid = validate_socket_address(&self.address) && self.path.is_some();
+				if ui.add_enabled(inputs_valid, button).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) && inputs_valid) {
 					// build args
 					let args = Args{
 						action: crate::cli::Action::Download {
