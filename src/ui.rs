@@ -262,7 +262,7 @@ impl eframe::App for ClientUi {
 /// Roughly validate a socket address string, without checking if domain exists.
 fn validate_socket_address(address: &str) -> bool {
     let re = regex::Regex::new(
-        r"/(([a-z]+\.)?[a-z]+(\.[a-z]+)?:[0-9]+)|([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]+)/g"
+        r"(([a-z]+\.)?[a-z]+(\.[a-z]+)?:[0-9]+)|([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]+)"
     ).unwrap();
     
     match re.captures(address) {
