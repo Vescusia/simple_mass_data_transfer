@@ -3,6 +3,7 @@ const net = std.net;
 const debug = std.debug.print;
 
 const msgio = @import("msgio.zig");
+const cryptio = @import("cryptio.zig");
 
 const alloc = @import("main.zig").alloc;
 
@@ -12,8 +13,7 @@ pub fn download() !void {
     debug("Stream: {}\n", .{stream});
     defer stream.close();
 
-    var msgwriter = try msgio.MessageWriter(u16, @TypeOf(stream.writer())).init(stream.writer());
+    var msgwriter = try cryptio.EncryptedWriter(1 << 10, @TypeOf(stream.writer())).init(alloc, stream.writer(), "ZATTY"[0..]);
 
-    const msgs = [_][]const u8 {"ZATTA1\n"[0..7], "ZATTAY2"[0..8], "ZATTAYY3\n"[0..8]};
-    try msgwriter.write_multiple(alloc, &msgs);
+    try msgwriter.writeMessage("HELLO?"[0..]);
 }

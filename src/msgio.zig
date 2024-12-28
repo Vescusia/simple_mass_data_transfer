@@ -1,8 +1,15 @@
 const std = @import("std");
 
 
+fn msg_size_t_is_valid(msg_size_t: type) bool {
+    return @typeInfo(msg_size_t) == .Int and @typeInfo(msg_size_t).Int.signedness == .unsigned;
+}
+
+
 pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
-    std.debug.assert(@typeInfo(msg_size_t) == .Int);
+    if (!msg_size_t_is_valid(msg_size_t)) {
+        @compileError("Message Size Integer Type has to be unsigned and an Int.");
+    }
 
     return struct {
         alloc: std.mem.Allocator,
@@ -15,12 +22,13 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
         const m_size_size = @sizeOf(msg_size_t);
         const Self = @This();
 
-        /// Caller owns the memory; deinitilize with `deinit`
+        /// Call `deinit` to free memory
         pub fn init(allocator: std.mem.Allocator, reader: reader_t) !Self {
-            return .{ .alloc = allocator, .reader = reader, .buf = try allocator.alloc(u8, 1 << 10), };
+            return withSize(allocator, reader, 1 << 10);
         }
 
-        pub fn with_size(allocator: std.mem.Allocator, reader: reader_t, size: usize) !Self {
+        /// Call `deinit` to free memory
+        pub fn withSize(allocator: std.mem.Allocator, reader: reader_t, size: usize) !Self {
             return .{ .alloc = allocator, .reader = reader, .buf = try allocator.alloc(u8, size), };
         }
 
@@ -28,12 +36,12 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
             self.alloc.free(self.buf);
         }
 
-        /// This will read a message from the underlying reader.
+        /// This will read a Message from the underlying Reader.
         ///
-        /// This will return null if the reader reaches EOF before the complete message could be read.
+        /// This will return null if the Reader reaches EOF before the complete Message could be read.
         ///
         /// **The returned array will be valid until this function is called again.**
-        pub fn read_msg(self: *Self) !?[]u8 {
+        pub fn readMessage(self: *Self) !?[]u8 {
             // get size of message
             while (self.bytes_read < m_size_size) {
                 const new_bytes_read = try self.reader.read(self.buf[self.bytes_read..]);
@@ -52,10 +60,7 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
 
             // check if buffer is large enough
             if (self.msg_size >= self.buf.len) {
-                const new_buf = try self.alloc.alloc(u8, self.buf.len * 2);
-                std.mem.copyForwards(u8, new_buf, self.buf);
-                self.alloc.free(self.buf);
-                self.buf = new_buf;
+                self.buf = try self.alloc.realloc(self.buf, self.msg_size * 2);
             }
 
             // fill up buffer
@@ -83,7 +88,9 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
 
 /// This writing is not buffered! If you are sending many small messages, please consider buffering the underlying Writer.
 pub fn MessageWriter(comptime msg_size_t: type, comptime writer_t: type) type {
-    std.debug.assert(@typeInfo(msg_size_t) == .Int);
+    if (!msg_size_t_is_valid(msg_size_t)) {
+        @compileError("Message Size Integer Type has to be unsigned and an Int.");
+    }
 
     return struct {
         writer: writer_t,
@@ -94,7 +101,7 @@ pub fn MessageWriter(comptime msg_size_t: type, comptime writer_t: type) type {
             return .{.writer = writer };
         }
 
-        pub fn write_message(self: *const Self, msg: []const u8) !void {
+        pub fn writeMessage(self: *const Self, msg: []const u8) !void {
             // message len to bytes
             const len: msg_size_t = std.mem.nativeToBig(msg_size_t, @intCast(msg.len));
             const size: [@sizeOf(msg_size_t)]u8 = std.mem.toBytes(len);
@@ -132,7 +139,7 @@ pub fn MessageWriter(comptime msg_size_t: type, comptime writer_t: type) type {
         /// Allocates a very small `iovec` array. All memory is freed when the function returns.
         ///
         /// This is useful when you would have to merge multiple arrays into one for a complete message.
-        pub fn write_multiple(self: *const Self, alloc: std.mem.Allocator, contents: []const []const u8) !void {
+        pub fn writeMultiple(self: *const Self, alloc: std.mem.Allocator, contents: []const []const u8) !void {
             // allocate iovecs + one iovec for the size
             var iovecs = try alloc.alloc(std.posix.iovec_const, contents.len+1);
             defer alloc.free(iovecs);
