@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "simple_mass_data_transfer",
+        .name = "smd_transfer",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
