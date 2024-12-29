@@ -7,11 +7,13 @@ const download = @import("download.zig").download;
 const msgio = @import("msgio.zig");
 
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-pub const alloc = gpa.allocator();
-
-
 pub fn main() !void {
+    // create gpa
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    defer std.debug.assert(gpa.deinit() == .ok);
+
+    // get args
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
@@ -23,11 +25,11 @@ pub fn main() !void {
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "host")) {
         debug("HOSTING\n", .{});
-        return server();
+        return server(alloc);
     }
     else if (std.mem.eql(u8, cmd, "dl")) {
         debug("DOWNLOADING\n", .{});
-        return download();
+        return download(alloc);
     }
     else {
         debug("Please use either 'host' or 'dl'!\n", .{});

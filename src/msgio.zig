@@ -59,7 +59,8 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
             }
 
             // check if buffer is large enough
-            if (self.msg_size >= self.buf.len) {
+            if (self.buf.len <= self.msg_size) {
+                // std.debug.print("MsgReader: resizing {} to {}\n", .{self.buf.len, self.msg_size * 2});
                 self.buf = try self.alloc.realloc(self.buf, self.msg_size * 2);
             }
 

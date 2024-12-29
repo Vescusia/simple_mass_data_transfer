@@ -52,13 +52,14 @@ pub fn EncryptedWriter(comptime max_msg_len: usize, comptime WriterT: type) type
             // tag (will get filled by encrypt)
             var tag: [chacha.tag_length]u8 = undefined;
 
-            // ensure that buffer is big enough
-            if (self.buf.len < content.len) {
-                self.buf = try self.alloc.realloc(self.buf, content.len * 2);
-            }
-
             // ensure that message fits into msg_size_t
             std.debug.assert(nonce.len + tag.len + content.len < max_msg_len);
+
+            // ensure that buffer is big enough
+            if (self.buf.len < content.len) {
+                // std.debug.print("CryptWriter: resizing {} to {}\n", .{self.buf.len, content.len * 2});
+                self.buf = try self.alloc.realloc(self.buf, content.len * 2);
+            }
 
             // encrypt into self.buf
             chacha.encrypt(self.buf[0..content.len], &tag, content, &ad, nonce, self.key);
@@ -75,6 +76,8 @@ pub fn EncryptedWriter(comptime max_msg_len: usize, comptime WriterT: type) type
 }
 
 
+/// It is absolutely crucial that both Writer and Reader have the same `max_msg_len`.
+/// Otherwise, behavior is undefined!
 pub fn EncryptedReader(comptime max_msg_len: usize, comptime ReaderT: type) type {
     const MsgSizeT = SmallestInt(max_msg_len);
     const msgreader_t = msgio.MessageReader(MsgSizeT, ReaderT);
@@ -126,13 +129,16 @@ pub fn EncryptedReader(comptime max_msg_len: usize, comptime ReaderT: type) type
             // extract tag
             const tag = everything[nonce.len..nonce.len + chacha.tag_length];
 
+            // extract encrypted data
+            const crypted = everything[nonce.len + tag.len..];
+
             // ensure that there is enough space in our buffer
-            if (self.buf.len < everything.len) {
-                self.buf = try self.alloc.realloc(self.buf, everything.len * 2);
+            if (self.buf.len < crypted.len) {
+                // std.debug.print("CryptReader: resizing {} to {}\n", .{self.buf.len, crypted.len * 2});
+                self.buf = try self.alloc.realloc(self.buf, crypted.len * 2);
             }
 
             // decrypt
-            const crypted = everything[nonce.len + tag.len..];
             try chacha.decrypt(self.buf[0..crypted.len], crypted, tag.*, &ad, nonce.*, self.key);
 
             return self.buf[0..crypted.len];
