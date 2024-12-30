@@ -19,7 +19,7 @@ pub fn download(alloc: std.mem.Allocator) !void {
     var writer = encrypted_io.writer(stream.writer());
 
     // write message
-    for (0..16) |_| {
+    for (0..128) |_| {
         try writer.writeMessage(" ty"[0..]);
     }
 }

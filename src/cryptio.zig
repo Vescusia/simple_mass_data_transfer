@@ -1,8 +1,6 @@
 const std = @import("std");
 const chacha = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
-const config = @import("config");
-
 const msgio = @import("msgio.zig");
 
 
@@ -95,21 +93,6 @@ pub fn EncryptedWriter(max_msg_len: usize, WriterT: type) type {
                 self.buf[0..content.len]
             };
             try self.msgwriter.writeMultiple(parts.len, parts);
-
-            // If we are sending over loopback, we have to sleep here for OS reasons.
-            // When sending too quickly, the Reader might pull some bytes twice.
-            // Or, more correctly, will read bytes out of order, with old, already read bytes, replacing new ones.
-            // That is not a TCP thing or an error in this code.
-            // The TCP-Packets somehow change or get pulled twice whilst the OS handles them.
-            // I checked multiple times with Wireshark.
-            // This is a cross-platform problem - perhaps an inherent thing with TCP implementations?
-            if (config.is_loopback) {
-                // When setting the sleep to 1 ms, for some reason the OS blocks waaaay longer.
-                // Like, magnitudes longer (on IO calls probably). Whilst 0.95 ms is still as fast as expected...
-                // Maybe the OS is doing something under the hood? Switching TCP implementations?
-                // (only tested on windows)
-                std.time.sleep(std.time.ns_per_ms);
-            }
         }
     };
 }

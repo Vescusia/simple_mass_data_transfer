@@ -6,8 +6,8 @@ fn msg_size_t_is_valid(msg_size_t: type) bool {
 }
 
 
-pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
-    if (!msg_size_t_is_valid(msg_size_t)) {
+pub fn MessageReader(comptime MsgSizeT: type, comptime reader_t: type) type {
+    if (!msg_size_t_is_valid(MsgSizeT)) {
         @compileError("Message Size Integer Type has to be unsigned and an Int.");
     }
 
@@ -15,11 +15,10 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
         alloc: std.mem.Allocator,
         buf: []u8,
         reader: reader_t,
-        msg_size: msg_size_t = 0,
-        size_read: bool = false,
+        msg_size: MsgSizeT = 0,
         bytes_read: usize = 0,
 
-        const m_size_size = @sizeOf(msg_size_t);
+        const m_size_size = @sizeOf(MsgSizeT);
         const Self = @This();
 
         /// Call `deinit` to free memory
@@ -42,24 +41,20 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
         ///
         /// **The returned array will be valid until this function is called again.**
         pub fn readMessage(self: *Self) !?[]u8 {
-            // get size of message
-            while (self.bytes_read < m_size_size) {
-                const new_bytes_read = try self.reader.read(self.buf[self.bytes_read..]);
-                if (new_bytes_read == 0) {
-                    return null;
-                }
-                self.bytes_read += new_bytes_read;
+            // clean up last call
+            if (self.bytes_read > self.msg_size + m_size_size) {
+                std.mem.copyForwards(u8, self.buf[0..self.bytes_read - self.msg_size - m_size_size], self.buf[self.msg_size + m_size_size..self.bytes_read]);
+                self.bytes_read -= m_size_size + self.msg_size;
+            } else {
+                self.bytes_read = 0;
             }
 
-            // convert size bytes to int
-            {
-                const msg_size = std.mem.bytesToValue(msg_size_t, self.buf[0..m_size_size]);
-                self.msg_size = std.mem.bigToNative(msg_size_t, msg_size);
-                self.msg_size += m_size_size;
-            }
+            // get size of message
+            self.msg_size = try self.get_msg_size() orelse return null;
+            const total_msg_size = m_size_size + self.msg_size;
 
             // fill up buffer
-            while (self.bytes_read < self.msg_size) {
+            while (self.bytes_read < total_msg_size) {
                 const new_bytes_read = try self.reader.read(self.buf[self.bytes_read..]);
                 if (new_bytes_read == 0) {
                     return null;
@@ -69,19 +64,30 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
 
             // if buffer got completely filled
             // double it's size (to prevent reads from "bottoming out" the buffer and losing performance)
-            if (self.buf.len <= self.msg_size) {
+            if (self.buf.len == self.bytes_read) {
                 self.buf = try self.alloc.realloc(self.buf, self.buf.len * 2);
             }
 
             // prepare return value
-            const msg = self.buf[m_size_size..self.msg_size];
-
-            // clean up
-            self.bytes_read -= self.msg_size;
-            self.msg_size = 0;
+            const msg = self.buf[m_size_size..total_msg_size];
 
             // return message
             return msg;
+        }
+
+        fn get_msg_size(self: *Self) !?MsgSizeT {
+            // read at least m_size_size Bytes
+            while (self.bytes_read < m_size_size) {
+                const new_bytes_read = try self.reader.read(self.buf[self.bytes_read..]);
+                if (new_bytes_read == 0) {
+                    return null;
+                }
+                self.bytes_read += new_bytes_read;
+            }
+
+            // convert bytes to int
+            const msg_size = std.mem.bytesToValue(MsgSizeT, self.buf[0..m_size_size]);
+            return std.mem.bigToNative(MsgSizeT, msg_size);  // network to native byte order
         }
     };
 }
