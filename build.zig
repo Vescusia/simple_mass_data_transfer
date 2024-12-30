@@ -22,6 +22,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // will this run on loopback?
+    // is necessary for some networking
+    const loopback = b.option(bool, "loopback", "Support Loopback (127.0.0.1)") orelse false;
+
+    // add options module
+    const options = b.addOptions();
+    options.addOption(bool, "is_loopback", loopback);
+    exe.root_module.addOptions("config", options);
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).

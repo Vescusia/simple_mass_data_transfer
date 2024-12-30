@@ -4,10 +4,9 @@ const Condition = std.Thread.Condition;
 const Mutex = std.Thread.Mutex;
 
 
-/// A Thread Safe Cyclic Buffer, with `buffer_amt` amount of arrays of length `arr_len`
+/// A Thread Safe Cyclic Buffer, with `buffer_amt` amount of Buffers of length `arr_len`
 ///
-/// A larger `buffer_amt` will allow for a bigger speed difference between Writer and Reader
-/// as well as being able to feather latency spikes
+/// A larger `buffer_amt` will cushion latency spikes better.
 ///
 /// The `arr_len` should be tuned to the Reader/Writer and allow them to fully use their IO Bursts
 pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
@@ -44,6 +43,8 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
 
         const CycleWriter = struct {
             super: *Super,
+            written: usize = 0,
+            write: *[arr_len]u8 = undefined,
 
             const Self = @This();
 
@@ -51,12 +52,15 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
             ///
             /// Returns a Pointer to the Buffered Array.
             ///
-            /// Will **not** block
+            /// Will **not** block.
             pub fn startWrite(self: *Self) *[arr_len]u8 {
-                self.super.mutex.lock();
-                defer self.super.mutex.unlock();
+                const super = self.super;
+
+                super.mutex.lock();
+                defer super.mutex.unlock();
+
                 // return buffer
-                return &self.super.buffers[self.super.writer_i].arr;
+                return &super.buffers[super.writer_i].arr;
             }
 
             /// Finish a Write, advancing to the next Buffer
@@ -72,14 +76,16 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
                 // set current Buffers written bytes
                 super.buffers[super.writer_i].written = written;
 
-                // wait for reader to progress away from the next buffer
+                // wait for Reader to finish reading from next Buffer
                 const next_i = (super.writer_i + 1) % buffer_amt;
                 while (next_i == super.reader_i) {
                     super.read_update.wait(&super.mutex);
                 }
 
-                // move to next buffer
+                // move to next Buffer
                 super.writer_i = next_i;
+
+                // signal Reader that a Buffer has been finished
                 super.write_update.signal();
             }
         };
@@ -102,40 +108,35 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
             ///
             /// Returns a Pointer to the Buffered Array
             ///
-            /// Will only block at first call, when there has been no
-            /// Buffer filled by the Writer yet.
+            /// Will Block if the Writer is too slow.
             pub fn startRead(self: *Self) []u8 {
-                self.super.mutex.lock();
-                defer self.super.mutex.unlock();
+                const super = self.super;
 
-                // wait for writer to progress away from us
-                while (self.super.reader_i == self.super.writer_i) {
-                    self.super.write_update.wait(&self.super.mutex);
+                super.mutex.lock();
+                defer super.mutex.unlock();
+
+                // wait for Writer to finish writing to current Buffer
+                while (super.reader_i == super.writer_i) {
+                    super.write_update.wait(&super.mutex);
                 }
 
-                // return the written bytes
-                const written = self.super.buffers[self.super.reader_i].written;
-                return self.super.buffers[self.super.reader_i].arr[0..written];
+                // return the Bytes
+                const written = super.buffers[super.reader_i].written;
+                return super.buffers[super.reader_i].arr[0..written];
             }
 
             /// Finish a Read, advancing to the next Buffer
             /// and allowing the Writer to overwrite this one
-            ///
-            /// Will Block if the Writer is too slow.
             pub fn finishRead(self: *Self) void {
                 const super = self.super;
 
                 super.mutex.lock();
                 defer super.mutex.unlock();
 
-                // wait for writer to progress away from the next buffer
-                const next_i = (super.reader_i + 1) % buffer_amt;
-                while (next_i == super.writer_i) {
-                    super.write_update.wait(&super.mutex);
-                }
+                // move to next Buffer
+                super.reader_i = (super.reader_i + 1) % buffer_amt;
 
-                // move to next buffer
-                super.reader_i = next_i;
+                // signal Writer that a Buffer has been finished
                 super.read_update.signal();
             }
         };

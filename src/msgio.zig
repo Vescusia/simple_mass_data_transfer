@@ -51,17 +51,11 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
                 self.bytes_read += new_bytes_read;
             }
 
-            // convert size bytes to int (in its own block because of variable scope)
+            // convert size bytes to int
             {
                 const msg_size = std.mem.bytesToValue(msg_size_t, self.buf[0..m_size_size]);
                 self.msg_size = std.mem.bigToNative(msg_size_t, msg_size);
                 self.msg_size += m_size_size;
-            }
-
-            // check if buffer is large enough
-            if (self.buf.len <= self.msg_size) {
-                // std.debug.print("MsgReader: resizing {} to {}\n", .{self.buf.len, self.msg_size * 2});
-                self.buf = try self.alloc.realloc(self.buf, self.msg_size * 2);
             }
 
             // fill up buffer
@@ -71,6 +65,12 @@ pub fn MessageReader(comptime msg_size_t: type, comptime reader_t: type) type {
                     return null;
                 }
                 self.bytes_read += new_bytes_read;
+            }
+
+            // if buffer got completely filled
+            // double it's size (to prevent reads from "bottoming out" the buffer and losing performance)
+            if (self.buf.len <= self.msg_size) {
+                self.buf = try self.alloc.realloc(self.buf, self.buf.len * 2);
             }
 
             // prepare return value
@@ -98,7 +98,7 @@ pub fn MessageWriter(comptime msg_size_t: type, comptime writer_t: type) type {
 
         const Self = @This();
 
-        pub fn init(writer: writer_t) !Self {
+        pub fn init(writer: writer_t) Self {
             return .{.writer = writer };
         }
 
@@ -137,13 +137,10 @@ pub fn MessageWriter(comptime msg_size_t: type, comptime writer_t: type) type {
 
         /// Combined write of multiple arrays into as message
         ///
-        /// Allocates a very small `iovec` array. All memory is freed when the function returns.
-        ///
         /// This is useful when you would have to merge multiple arrays into one for a complete message.
-        pub fn writeMultiple(self: *const Self, alloc: std.mem.Allocator, contents: []const []const u8) !void {
+        pub fn writeMultiple(self: *const Self, comptime len: usize, contents: [len][]const u8) !void {
             // allocate iovecs + one iovec for the size
-            var iovecs = try alloc.alloc(std.posix.iovec_const, contents.len+1);
-            defer alloc.free(iovecs);
+            var iovecs: [len+1]std.posix.iovec_const = undefined;
 
             // initialize iovecs and calculate total length
             var total_len: msg_size_t = 0;
@@ -161,7 +158,7 @@ pub fn MessageWriter(comptime msg_size_t: type, comptime writer_t: type) type {
             iovecs[0] = .{ .base = &size, .len = size.len };
 
             // write
-            try self.writevAll(iovecs);
+            try self.writevAll(&iovecs);
         }
     };
 }

@@ -1,49 +1,79 @@
 const std = @import("std");
 const chacha = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
+const config = @import("config");
+
 const msgio = @import("msgio.zig");
 
 
 const ad: [0]u8 = undefined;
 
 
-/// It is absolutely crucial that both Writer and Reader have the same `max_msg_len`.
-/// Otherwise, behavior is undefined!
-pub fn EncryptedWriter(comptime max_msg_len: usize, comptime WriterT: type) type {
-    const MsgSizeT = SmallestInt(max_msg_len);
-    const MsgWriterT = msgio.MessageWriter(MsgSizeT, WriterT);
+/// Creates a XChaCha20Poly1305 encrypted File from an underlying File.
+///
+/// It is absolutely crucial that both communicating Partners use the same `max_msg_len`!.
+/// Otherwise Communication will not be possible.
+///
+/// * `max_msg_len`: the maximum length (in bytes) of the sent messages;
+/// it is UB if these boundaries are exceeded!
+/// Also, this directly controls the length of the Cipher Buffers (on Stack), so it should be kept somewhat small.
+/// (but big enough to not get overly many `writeMessage`/`readMessage` calls, along their overhead)
+/// * `file`: the underlying IO object; must have `.reader()` and `.writer()` implemented.
+/// * `key`: does not need to be padded, will be done internally
+pub fn EncryptedIO(max_msg_len: usize, FileT: type, key: []const u8) type {
+    // construct the type of the underlying Writer and Reader
+    const WriterT = @typeInfo(@TypeOf(FileT.writer)).Fn.return_type.?;
+    const ReaderT = @typeInfo(@TypeOf(FileT.reader)).Fn.return_type.?;
 
-    const rand = std.crypto.random;
+    // construct the type of the encrypted Writer and Reader
+    const EncryptedWriterT = EncryptedWriter(max_msg_len, WriterT);
+    const EncryptedReaderT = EncryptedReader(max_msg_len, ReaderT);
+
+    std.debug.assert(EncryptedWriterT.MsgSizeT == EncryptedReaderT.MsgSizeT);
 
     return struct {
+        pub const MsgSizeT = EncryptedWriterT.MsgSizeT;
+
+        pub fn writer(underlying_writer: WriterT) EncryptedWriterT {
+            return EncryptedWriterT.init(underlying_writer, key);
+        }
+
+        /// Caller has to `.deinit()` to deallocate the memory
+        pub fn reader(alloc: std.mem.Allocator, underlying_reader: ReaderT) !EncryptedReaderT {
+            return EncryptedReaderT.init(alloc, underlying_reader, key);
+        }
+    };
+}
+
+
+/// It is absolutely crucial that both Writer and Reader have the same `max_msg_len`.
+/// Otherwise, behavior is undefined!
+pub fn EncryptedWriter(max_msg_len: usize, WriterT: type) type {
+    return struct {
         msgwriter: MsgWriterT,
-        buf: []u8,
-        alloc: std.mem.Allocator,
         key: [chacha.key_length] u8,
+        buf: [total_max_msg_len]u8,
+
+        pub const total_max_msg_len = chacha.nonce_length + chacha.tag_length + max_msg_len;
+
+        pub const MsgSizeT = SmallestInt(total_max_msg_len + chacha.nonce_length + chacha.tag_length);
+        const MsgWriterT = msgio.MessageWriter(MsgSizeT, WriterT);
+
+        const rand = std.crypto.random;
 
         const Self = @This();
 
-        /// Call `deinit` to free memory
-        pub fn withSize(alloc: std.mem.Allocator, writer: WriterT, key: []const u8, buffersize: usize) !Self {
-            const self = .{
-                .msgwriter = try MsgWriterT.init(writer),
-                .buf = try alloc.alloc(u8, buffersize),
-                .alloc = alloc,
+        pub fn init(writer: WriterT, key: []const u8) Self {
+            return Self{
+                .msgwriter = msgio.MessageWriter(MsgSizeT, WriterT).init(writer),
                 .key = padKey(key),
+                .buf = std.mem.zeroes([total_max_msg_len]u8),
             };
-
-            return self;
         }
 
-        /// Call `deinit` to free memory
-        pub fn init(alloc: std.mem.Allocator, writer: WriterT, key: []const u8) !Self {
-            return Self.withSize(alloc, writer, key, 1 << 10);
-        }
-
-        pub fn deinit(self: Self) void {
-            self.alloc.free(self.buf);
-        }
-
+        /// Write an encrypted Message
+        ///
+        /// All memory allocated with `alloc` will be freed before this method returns.
         pub fn writeMessage(self: *Self, content: []const u8) !void {
             // generate nonce
             var nonce: [chacha.nonce_length]u8 = undefined;
@@ -52,14 +82,8 @@ pub fn EncryptedWriter(comptime max_msg_len: usize, comptime WriterT: type) type
             // tag (will get filled by encrypt)
             var tag: [chacha.tag_length]u8 = undefined;
 
-            // ensure that message fits into msg_size_t
-            std.debug.assert(nonce.len + tag.len + content.len < max_msg_len);
-
-            // ensure that buffer is big enough
-            if (self.buf.len < content.len) {
-                // std.debug.print("CryptWriter: resizing {} to {}\n", .{self.buf.len, content.len * 2});
-                self.buf = try self.alloc.realloc(self.buf, content.len * 2);
-            }
+            // ensure that message fits into buffer (and msg_size_t)
+            std.debug.assert(nonce.len + tag.len + content.len <= total_max_msg_len);
 
             // encrypt into self.buf
             chacha.encrypt(self.buf[0..content.len], &tag, content, &ad, nonce, self.key);
@@ -70,7 +94,22 @@ pub fn EncryptedWriter(comptime max_msg_len: usize, comptime WriterT: type) type
                 &tag,
                 self.buf[0..content.len]
             };
-            try self.msgwriter.writeMultiple(self.alloc, &parts);
+            try self.msgwriter.writeMultiple(parts.len, parts);
+
+            // If we are sending over loopback, we have to sleep here for OS reasons.
+            // When sending too quickly, the Reader might pull some bytes twice.
+            // Or, more correctly, will read bytes out of order, with old, already read bytes, replacing new ones.
+            // That is not a TCP thing or an error in this code.
+            // The TCP-Packets somehow change or get pulled twice whilst the OS handles them.
+            // I checked multiple times with Wireshark.
+            // This is a cross-platform problem - perhaps an inherent thing with TCP implementations?
+            if (config.is_loopback) {
+                // When setting the sleep to 1 ms, for some reason the OS blocks waaaay longer.
+                // Like, magnitudes longer (on IO calls probably). Whilst 0.95 ms is still as fast as expected...
+                // Maybe the OS is doing something under the hood? Switching TCP implementations?
+                // (only tested on windows)
+                std.time.sleep(std.time.ns_per_ms);
+            }
         }
     };
 }
@@ -78,50 +117,39 @@ pub fn EncryptedWriter(comptime max_msg_len: usize, comptime WriterT: type) type
 
 /// It is absolutely crucial that both Writer and Reader have the same `max_msg_len`.
 /// Otherwise, behavior is undefined!
-pub fn EncryptedReader(comptime max_msg_len: usize, comptime ReaderT: type) type {
-    const MsgSizeT = SmallestInt(max_msg_len);
-    const msgreader_t = msgio.MessageReader(MsgSizeT, ReaderT);
-
+pub fn EncryptedReader(max_msg_len: usize, ReaderT: type) type {
     return struct {
-        msgreader: msgreader_t,
+        msgreader: MsgReaderT,
         key: [chacha.key_length] u8,
-        alloc: std.mem.Allocator,
-        buf: []u8,
+        buf: [total_max_msg_len]u8,
+
+        pub const total_max_msg_len = chacha.nonce_length + chacha.tag_length + max_msg_len;
+
+        const MsgReaderT = msgio.MessageReader(MsgSizeT, ReaderT);
+        pub const MsgSizeT = SmallestInt(total_max_msg_len + chacha.nonce_length + chacha.tag_length);
 
         const Self = @This();
 
         /// Call `deinit` to free memory
-        pub fn withSize(alloc: std.mem.Allocator, reader: ReaderT, key: []const u8, buffersize: usize) !Self {
-            const self = .{
-                .msgreader = try msgreader_t.withSize(alloc, reader, buffersize),
-                .key = padKey(key),
-                .alloc = alloc,
-                .buf = try alloc.alloc(u8, buffersize),
-            };
-
-            return self;
-        }
-
-        /// Call `deinit` to free memory
         pub fn init(alloc: std.mem.Allocator, reader: ReaderT, key: []const u8) !Self {
-            return Self.withSize(alloc, reader, key, 1 << 10);
+            return Self{
+                .msgreader = try msgio.MessageReader(MsgSizeT, ReaderT).withSize(alloc, reader, total_max_msg_len),
+                .key = padKey(key),
+                .buf = undefined,
+            };
         }
 
         pub fn deinit(self: Self) void {
             self.msgreader.deinit();
-            self.alloc.free(self.buf);
         }
 
         /// **Returned slice will be valid until this function is called again.**
         pub fn readMessage(self: *Self) !?[]u8 {
             // get whole message
-            const everything = blk: {
-                const everything_opt = try self.msgreader.readMessage();
-                if (everything_opt == null) {
-                    return null;
-                }
-                break :blk everything_opt.?;
-            };
+            const everything = try self.msgreader.readMessage() orelse return null;
+
+            // ensure that message fits into buffer
+            std.debug.assert(everything.len <= total_max_msg_len);
 
             // extract nonce
             const nonce = everything[0..chacha.nonce_length];
@@ -132,12 +160,6 @@ pub fn EncryptedReader(comptime max_msg_len: usize, comptime ReaderT: type) type
             // extract encrypted data
             const crypted = everything[nonce.len + tag.len..];
 
-            // ensure that there is enough space in our buffer
-            if (self.buf.len < crypted.len) {
-                // std.debug.print("CryptReader: resizing {} to {}\n", .{self.buf.len, crypted.len * 2});
-                self.buf = try self.alloc.realloc(self.buf, crypted.len * 2);
-            }
-
             // decrypt
             try chacha.decrypt(self.buf[0..crypted.len], crypted, tag.*, &ad, nonce.*, self.key);
 
@@ -147,15 +169,16 @@ pub fn EncryptedReader(comptime max_msg_len: usize, comptime ReaderT: type) type
 }
 
 
-/// Calculate the smallest integer that can represent the `max_size` and is a multiple of 8 (bits)
+/// Calculate the smallest Integer Type that can represent the `max_size` and is a multiple of 8 (bits)
 fn SmallestInt(comptime max_size: usize) type {
     const bits = @as(u16, @floor(@log2(@as(f64, max_size))));
     return @Type(.{ .Int = .{ .signedness = .unsigned, .bits = bits + 8 - bits % 8 } });  // needs to be a multiple of 8
 }
 
 test "basic_smallest_int" {
-    const max_size = 1027;
-    try std.testing.expect(SmallestInt(max_size) == u16);
+    try std.testing.expect(SmallestInt(1027) == u16);
+    try std.testing.expect(SmallestInt(256) == u16);
+    try std.testing.expect(SmallestInt(255) == u8);
 }
 
 

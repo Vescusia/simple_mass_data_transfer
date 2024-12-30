@@ -7,6 +7,10 @@ const download = @import("download.zig").download;
 const msgio = @import("msgio.zig");
 
 
+// get stdout and stdin
+
+
+
 pub fn main() !void {
     // create gpa
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
