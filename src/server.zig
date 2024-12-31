@@ -51,8 +51,7 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection) !void 
     defer debug("Client<{}> disconnected.\n", .{client.address});
 
     // create encrypted io
-    const encrypted_io = cryptio.EncryptedIO(max_msg_len, @TypeOf(client.stream), "raw_key: []const u8");
-    var reader = try encrypted_io.reader(alloc, client.stream.reader());
+    var reader = try cryptio.EncryptedReader(max_msg_len, @TypeOf(client.stream)).init(alloc, client.stream, "raw_key: []const u8");
     defer reader.deinit();
 
     const start = try std.time.Instant.now();

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 
 fn msg_size_t_is_valid(msg_size_t: type) bool {
@@ -6,33 +7,56 @@ fn msg_size_t_is_valid(msg_size_t: type) bool {
 }
 
 
-pub fn MessageReader(comptime MsgSizeT: type, comptime reader_t: type) type {
+pub fn MessageReader(comptime MsgSizeT: type, comptime ReaderT: type) type {
     if (!msg_size_t_is_valid(MsgSizeT)) {
         @compileError("Message Size Integer Type has to be unsigned and an Int.");
     }
 
     return struct {
         alloc: std.mem.Allocator,
-        buf: []u8,
-        reader: reader_t,
-        msg_size: MsgSizeT = 0,
-        bytes_read: usize = 0,
+        reader: ReaderT,
+        total_msg_size: MsgSizeT = undefined,
+        main_buf: Buf,
+        aux_buf: Buf,
+
+        const Buf = struct {
+            arr: []u8,
+            total_read: usize = 0,
+        };
 
         const m_size_size = @sizeOf(MsgSizeT);
         const Self = @This();
 
+        /// Will be true if the `MessageReader` will be using vectored Reads.
+        /// Not using vectored Reads will (probably) result in a small performance reduction
+        /// as
+        const using_readv: bool = blk: {
+            for (@typeInfo(ReaderT).Struct.decls) |decl| {
+                if (std.mem.eql(u8, decl.name, "readv")) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+
         /// Call `deinit` to free memory
-        pub fn init(allocator: std.mem.Allocator, reader: reader_t) !Self {
+        pub fn init(allocator: std.mem.Allocator, reader: ReaderT) !Self {
             return withSize(allocator, reader, 1 << 10);
         }
 
         /// Call `deinit` to free memory
-        pub fn withSize(allocator: std.mem.Allocator, reader: reader_t, size: usize) !Self {
-            return .{ .alloc = allocator, .reader = reader, .buf = try allocator.alloc(u8, size), };
+        pub fn withSize(allocator: std.mem.Allocator, reader: ReaderT, size: usize) !Self {
+            return .{
+                .alloc = allocator,
+                .reader = reader,
+                .main_buf = .{ .arr = try allocator.alloc(u8, size) },
+                .aux_buf = .{ .arr = try allocator.alloc(u8, size) },
+            };
         }
 
         pub fn deinit(self: Self) void {
-            self.alloc.free(self.buf);
+            self.alloc.free(self.main_buf.arr);
+            self.alloc.free(self.aux_buf.arr);
         }
 
         /// This will read a Message from the underlying Reader.
@@ -42,52 +66,143 @@ pub fn MessageReader(comptime MsgSizeT: type, comptime reader_t: type) type {
         /// **The returned array will be valid until this function is called again.**
         pub fn readMessage(self: *Self) !?[]u8 {
             // clean up last call
-            if (self.bytes_read > self.msg_size + m_size_size) {
-                std.mem.copyForwards(u8, self.buf[0..self.bytes_read - self.msg_size - m_size_size], self.buf[self.msg_size + m_size_size..self.bytes_read]);
-                self.bytes_read -= m_size_size + self.msg_size;
-            } else {
-                self.bytes_read = 0;
+            self.main_buf.total_read = 0;
+            self.total_msg_size = undefined;
+            std.mem.swap(Buf, &self.main_buf, &self.aux_buf);
+
+            // get new message size
+            self.total_msg_size = try self.getTotalMsgSize() orelse return null;
+
+            // read message bytes
+            // decide which readToSize function to use
+            if (using_readv) {
+                try self.readToSizeVectored(self.total_msg_size) orelse return null;
+            }
+            else {
+                // less efficient :(
+                try self.readToSize(self.total_msg_size) orelse return null;
             }
 
-            // get size of message
-            self.msg_size = try self.get_msg_size() orelse return null;
-            const total_msg_size = m_size_size + self.msg_size;
-
-            // fill up buffer
-            while (self.bytes_read < total_msg_size) {
-                const new_bytes_read = try self.reader.read(self.buf[self.bytes_read..]);
-                if (new_bytes_read == 0) {
-                    return null;
-                }
-                self.bytes_read += new_bytes_read;
-            }
-
-            // if buffer got completely filled
-            // double it's size (to prevent reads from "bottoming out" the buffer and losing performance)
-            if (self.buf.len == self.bytes_read) {
-                self.buf = try self.alloc.realloc(self.buf, self.buf.len * 2);
-            }
-
-            // prepare return value
-            const msg = self.buf[m_size_size..total_msg_size];
-
-            // return message
-            return msg;
+            // return
+            return self.main_buf.arr[m_size_size..self.total_msg_size];
         }
 
-        fn get_msg_size(self: *Self) !?MsgSizeT {
-            // read at least m_size_size Bytes
-            while (self.bytes_read < m_size_size) {
-                const new_bytes_read = try self.reader.read(self.buf[self.bytes_read..]);
-                if (new_bytes_read == 0) {
+        // uses iovecs to efficiently handle read overflows
+        // std.io.GenericReader has no readv LMAO imma kms
+        fn readToSizeVectored(self: *Self, total_size: usize) !?void {
+            if (self.main_buf.total_read == total_size) {
+                return;
+            }
+            std.debug.assert(self.main_buf.arr.len > total_size);
+
+            // build iovecs
+            var iovecs = [_]std.posix.iovec {
+                .{ .base = self.main_buf.arr.ptr + self.main_buf.total_read, .len = total_size - self.main_buf.total_read },
+                .{ .base = self.aux_buf.arr.ptr + self.aux_buf.total_read, .len = self.aux_buf.arr.len - self.aux_buf.total_read }
+            };
+
+            // read up to total_size
+            while (true) {
+                const amt_read = try self.reader.readv(&iovecs);
+                if (amt_read == 0) {
                     return null;
                 }
-                self.bytes_read += new_bytes_read;
+
+                if (iovecs[0].len <= amt_read) {
+                    self.aux_buf.total_read += amt_read - iovecs[0].len;
+                    self.main_buf.total_read = total_size;
+                    break;
+                }
+                iovecs[0].base += amt_read;
+                iovecs[0].len -= amt_read;
+            }
+
+            // increase buffer sizes if we hit the limit on the aux array
+            if (self.aux_buf.total_read == self.aux_buf.arr.len) {
+                try self.doubleBufs();
+            }
+        }
+
+        fn readToSize(self: *Self, total_size: usize) !?void {
+            if (self.main_buf.total_read == total_size) {
+                return;
+            }
+            std.debug.assert(self.main_buf.arr.len > total_size);
+
+            // read to at least total size
+            while (self.main_buf.total_read < total_size) {
+                const read = try self.reader.read(self.main_buf.arr[self.main_buf.total_read..]);
+                if (read == 0) {
+                    return null;
+                }
+                self.main_buf.total_read += read;
+            }
+
+            // handle overread
+            if (self.main_buf.total_read > self.total_msg_size) {
+                const overread = self.main_buf.total_read - self.total_msg_size;
+                @memcpy(
+                    self.aux_buf.arr[self.aux_buf.total_read..self.aux_buf.total_read + overread],
+                    self.main_buf.arr[total_size..total_size + overread]
+                );
+                self.aux_buf.total_read += overread;
+            }
+
+            // if we completely filled the buffer with this read
+            // increase their size to prevent not fully using read syscalls
+            if (self.main_buf.total_read == self.main_buf.arr.len) {
+                try self.doubleBufs();
+            }
+
+            self.main_buf.total_read = total_size;
+        }
+
+        fn resizeBufs(self: *Self, new_size: usize) !void {
+            self.main_buf.arr = try self.alloc.realloc(self.main_buf.arr, new_size);
+            self.aux_buf.arr = try self.alloc.realloc(self.aux_buf.arr, new_size);
+        }
+
+        fn doubleBufs(self: *Self) !void {
+            return self.resizeBufs(self.main_buf.arr.len * 2);
+        }
+
+        /// Resizes the buffers to fit the message
+        fn getTotalMsgSize(self: *Self) !?MsgSizeT {
+            // gather bytes (read overflows into message, as long as main array is big enough)
+            // could possibly read more bytes than are part of the message
+            while (self.main_buf.total_read < m_size_size) {
+                const read = try self.reader.read(self.main_buf.arr[self.main_buf.total_read..]);
+                if (read == 0) {
+                    return null;
+                }
+                self.main_buf.total_read += read;
             }
 
             // convert bytes to int
-            const msg_size = std.mem.bytesToValue(MsgSizeT, self.buf[0..m_size_size]);
-            return std.mem.bigToNative(MsgSizeT, msg_size);  // network to native byte order
+            var total_msg_size = std.mem.bytesToValue(MsgSizeT, self.main_buf.arr[0..m_size_size]);
+            total_msg_size = std.mem.bigToNative(MsgSizeT, total_msg_size);  // network to native byte order
+            total_msg_size += m_size_size;
+
+            // check if the main buffer got copletely filled
+            // or if the message does not fit into the buffer
+            if (self.main_buf.arr.len == self.main_buf.total_read or self.main_buf.arr.len < total_msg_size) {
+                // resize both buffers, as this should not happen
+                // for performance reasons (not every byte of the last read syscall is actually "being used")
+                // and of course, because we might not be able to fit the message!
+                const new_len = @max(self.main_buf.arr.len, self.total_msg_size) * 2;
+                try self.resizeBufs(new_len);
+            }
+
+            // handle message overreading
+            if (self.main_buf.total_read > total_msg_size) {
+                const overread = self.main_buf.total_read - total_msg_size;
+                @memcpy(self.aux_buf.arr[0..overread], self.main_buf.arr[total_msg_size..self.main_buf.total_read]);
+
+                self.aux_buf.total_read = overread;
+                self.main_buf.total_read = total_msg_size;
+            }
+
+            return total_msg_size;
         }
     };
 }
@@ -120,21 +235,23 @@ pub fn MessageWriter(comptime msg_size_t: type, comptime writer_t: type) type {
             };
 
             // write
-            try self.writevAll(&iovecs);
+            try self.writevAll(iovecs.len, &iovecs);
         }
 
         // This is not part of std.io.GenericWriter??
+        // Well, I do not care, it is too important. If the writer does not work with std.posix.writev, get fucked.
         //
         // On windows, this will literally not offer any performance increase lol.
         // It does not have an equivalent syscall.
-        fn writevAll(self: *const Self, iovecs: []std.posix.iovec_const) !void {
+        fn writevAll(self: *const Self, comptime len: usize, iovecs: *[len]std.posix.iovec_const) !void {
             var i: usize = 0;
+
             while (true) {
                 var amt = try std.posix.writev(self.writer.context.handle, iovecs[i..]);
                 while (amt >= iovecs[i].len) {
                     amt -= iovecs[i].len;
                     i += 1;
-                    if (i >= iovecs.len) return;
+                    if (i >= len) return;
                 }
                 iovecs[i].base += amt;
                 iovecs[i].len -= amt;
@@ -150,7 +267,7 @@ pub fn MessageWriter(comptime msg_size_t: type, comptime writer_t: type) type {
 
             // initialize iovecs and calculate total length
             var total_len: msg_size_t = 0;
-            for (1.., contents) |i, content| {
+            inline for (1.., contents) |i, content| {
                 iovecs[i].base = content.ptr;
                 iovecs[i].len = content.len;
                 total_len += @intCast(content.len);
@@ -164,7 +281,7 @@ pub fn MessageWriter(comptime msg_size_t: type, comptime writer_t: type) type {
             iovecs[0] = .{ .base = &size, .len = size.len };
 
             // write
-            try self.writevAll(&iovecs);
+            try self.writevAll(iovecs.len, &iovecs);
         }
     };
 }

@@ -62,7 +62,7 @@ pub fn EncryptedWriter(max_msg_len: usize, WriterT: type) type {
         const Self = @This();
 
         pub fn init(writer: WriterT, key: []const u8) Self {
-            return Self{
+            return .{
                 .msgwriter = msgio.MessageWriter(MsgSizeT, WriterT).init(writer),
                 .key = padKey(key),
                 .buf = std.mem.zeroes([total_max_msg_len]u8),
@@ -115,7 +115,7 @@ pub fn EncryptedReader(max_msg_len: usize, ReaderT: type) type {
 
         /// Call `deinit` to free memory
         pub fn init(alloc: std.mem.Allocator, reader: ReaderT, key: []const u8) !Self {
-            return Self{
+            return .{
                 .msgreader = try msgio.MessageReader(MsgSizeT, ReaderT).withSize(alloc, reader, total_max_msg_len),
                 .key = padKey(key),
                 .buf = undefined,
