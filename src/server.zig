@@ -6,7 +6,7 @@ const msgio = @import("msgio.zig");
 const cryptio = @import("cryptio.zig");
 
 
-const max_msg_len = 32;
+const max_msg_len = 1 << 12;
 
 
 pub fn server(alloc: std.mem.Allocator) !void {
@@ -51,8 +51,10 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection) !void 
     defer debug("Client<{}> disconnected.\n", .{client.address});
 
     // create encrypted io
-    var reader = try cryptio.EncryptedReader(max_msg_len, @TypeOf(client.stream)).init(alloc, client.stream, "raw_key: []const u8");
+    const EncryptedStream = cryptio.EncryptedIO(max_msg_len, @TypeOf(client.stream), "raw_key: []const u8");
+    var reader = try EncryptedStream.reader(alloc, client.stream.reader());
     defer reader.deinit();
+    debug("Using vectored reads: {}\n", .{ @TypeOf(reader).using_readv });
 
     const start = try std.time.Instant.now();
     var msg_opt = try reader.readMessage();

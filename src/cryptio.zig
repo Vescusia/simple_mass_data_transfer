@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const chacha = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
 const msgio = @import("msgio.zig");
@@ -47,17 +48,22 @@ pub fn EncryptedIO(max_msg_len: usize, FileT: type, key: []const u8) type {
 /// It is absolutely crucial that both Writer and Reader have the same `max_msg_len`.
 /// Otherwise, behavior is undefined!
 pub fn EncryptedWriter(max_msg_len: usize, WriterT: type) type {
+    // create integer with nonce length bits
+    const NonceIntT = @Type(.{
+        .Int = .{ .signedness = .unsigned, .bits = chacha.nonce_length * 8 }
+    });
+
     return struct {
         msgwriter: MsgWriterT,
         key: [chacha.key_length] u8,
         buf: [total_max_msg_len]u8,
+        // incrementing, initially random nonce
+        nonce: [chacha.nonce_length]u8,
 
         pub const total_max_msg_len = chacha.nonce_length + chacha.tag_length + max_msg_len;
 
         pub const MsgSizeT = SmallestInt(total_max_msg_len + chacha.nonce_length + chacha.tag_length);
         const MsgWriterT = msgio.MessageWriter(MsgSizeT, WriterT);
-
-        const rand = std.crypto.random;
 
         const Self = @This();
 
@@ -66,6 +72,11 @@ pub fn EncryptedWriter(max_msg_len: usize, WriterT: type) type {
                 .msgwriter = msgio.MessageWriter(MsgSizeT, WriterT).init(writer),
                 .key = padKey(key),
                 .buf = std.mem.zeroes([total_max_msg_len]u8),
+                .nonce = blk: {
+                    var nonce: [chacha.nonce_length]u8 = undefined;
+                    std.crypto.random.bytes(&nonce);
+                    break :blk nonce;
+                },
             };
         }
 
@@ -73,22 +84,22 @@ pub fn EncryptedWriter(max_msg_len: usize, WriterT: type) type {
         ///
         /// All memory allocated with `alloc` will be freed before this method returns.
         pub fn writeMessage(self: *Self, content: []const u8) !void {
-            // generate nonce
-            var nonce: [chacha.nonce_length]u8 = undefined;
-            rand.bytes(&nonce);
+            // increment nonce
+            const new_nonce = std.mem.bytesToValue(NonceIntT, &self.nonce) +% 1;
+            self.nonce = std.mem.bytesToValue(@TypeOf(self.nonce), std.mem.asBytes(&new_nonce));
 
             // tag (will get filled by encrypt)
             var tag: [chacha.tag_length]u8 = undefined;
 
             // ensure that message fits into buffer (and msg_size_t)
-            std.debug.assert(nonce.len + tag.len + content.len <= total_max_msg_len);
+            std.debug.assert(chacha.nonce_length + tag.len + content.len <= total_max_msg_len);
 
             // encrypt into self.buf
-            chacha.encrypt(self.buf[0..content.len], &tag, content, &ad, nonce, self.key);
+            chacha.encrypt(self.buf[0..content.len], &tag, content, &ad, self.nonce, self.key);
 
             // write
             const parts = [_][]const u8 {
-                &nonce,
+                &self.nonce,
                 &tag,
                 self.buf[0..content.len]
             };
@@ -106,17 +117,24 @@ pub fn EncryptedReader(max_msg_len: usize, ReaderT: type) type {
         key: [chacha.key_length] u8,
         buf: [total_max_msg_len]u8,
 
+        /// This is the total maximum length used internally, which includes the nonce, tag and message itself
         pub const total_max_msg_len = chacha.nonce_length + chacha.tag_length + max_msg_len;
 
         const MsgReaderT = msgio.MessageReader(MsgSizeT, ReaderT);
         pub const MsgSizeT = SmallestInt(total_max_msg_len + chacha.nonce_length + chacha.tag_length);
+
+        /// Will be true if the `EncryptedReader` is using vectored Reads.
+        /// Not using vectored Reads will (probably) result in a small performance reduction.
+        ///
+        /// If this returns `false`, consider using an underlying Reader that implements `readv`.
+        pub const using_readv = MsgReaderT.using_readv;
 
         const Self = @This();
 
         /// Call `deinit` to free memory
         pub fn init(alloc: std.mem.Allocator, reader: ReaderT, key: []const u8) !Self {
             return .{
-                .msgreader = try msgio.MessageReader(MsgSizeT, ReaderT).withSize(alloc, reader, total_max_msg_len),
+                .msgreader = try msgio.MessageReader(MsgSizeT, ReaderT).init(alloc, reader),
                 .key = padKey(key),
                 .buf = undefined,
             };

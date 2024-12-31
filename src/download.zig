@@ -6,7 +6,7 @@ const msgio = @import("msgio.zig");
 const cryptio = @import("cryptio.zig");
 
 
-const max_msg_len = 32;
+const max_msg_len = 1 << 12;
 
 
 pub fn download(alloc: std.mem.Allocator) !void {
@@ -18,8 +18,10 @@ pub fn download(alloc: std.mem.Allocator) !void {
     const encrypted_io = cryptio.EncryptedIO(max_msg_len, @TypeOf(stream), "raw_key: []const u8");
     var writer = encrypted_io.writer(stream.writer());
 
+    const msg: [max_msg_len]u8 = undefined;
+
     // write message
-    for (0..32) |_| {
-        try writer.writeMessage(" ty"[0..]);
+    for (0..4096) |_| {
+        try writer.writeMessage(&msg);
     }
 }

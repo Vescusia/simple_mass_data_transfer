@@ -1,5 +1,11 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const print = std.debug.print;
+
+
+const debug = true and switch (@import("builtin").mode) {
+    .Debug => true,
+    else => false,
+};
 
 
 fn msg_size_t_is_valid(msg_size_t: type) bool {
@@ -16,6 +22,7 @@ pub fn MessageReader(comptime MsgSizeT: type, comptime ReaderT: type) type {
         alloc: std.mem.Allocator,
         reader: ReaderT,
         total_msg_size: MsgSizeT = undefined,
+        super_arr: []u8,
         main_buf: Buf,
         aux_buf: Buf,
 
@@ -24,13 +31,28 @@ pub fn MessageReader(comptime MsgSizeT: type, comptime ReaderT: type) type {
             total_read: usize = 0,
         };
 
+
         const m_size_size = @sizeOf(MsgSizeT);
         const Self = @This();
 
-        /// Will be true if the `MessageReader` will be using vectored Reads.
-        /// Not using vectored Reads will (probably) result in a small performance reduction
-        /// as
-        const using_readv: bool = blk: {
+        const using_context_readv: bool = blk: {
+            for (@typeInfo(ReaderT).Struct.fields) |field| {
+                if (std.mem.eql(u8, field.name, "context")) {
+                    for (@typeInfo(field.type).Struct.decls) |decl| {
+                        if (std.mem.eql(u8, decl.name, "readv")) {
+                            break :blk true;
+                        }
+                    }
+                }
+            }
+            break :blk false;
+        };
+
+        /// Will be true if the `MessageReader` is using vectored Reads.
+        /// Not using vectored Reads will (probably) result in a small performance reduction.
+        ///
+        /// If this returns `false`, consider using an underlying Reader that implements `readv`.
+        pub const using_readv: bool = using_context_readv or blk: {
             for (@typeInfo(ReaderT).Struct.decls) |decl| {
                 if (std.mem.eql(u8, decl.name, "readv")) {
                     break :blk true;
@@ -41,22 +63,46 @@ pub fn MessageReader(comptime MsgSizeT: type, comptime ReaderT: type) type {
 
         /// Call `deinit` to free memory
         pub fn init(allocator: std.mem.Allocator, reader: ReaderT) !Self {
-            return withSize(allocator, reader, 1 << 10);
+            return withSize(allocator, reader, 1 << 24);
         }
 
         /// Call `deinit` to free memory
         pub fn withSize(allocator: std.mem.Allocator, reader: ReaderT, size: usize) !Self {
+            // use a big array that the main and auxillary buffers actually point to
+            // for cache completeness
+            const super_arr = try allocator.alloc(u8, size * 2);
+
             return .{
                 .alloc = allocator,
                 .reader = reader,
-                .main_buf = .{ .arr = try allocator.alloc(u8, size) },
-                .aux_buf = .{ .arr = try allocator.alloc(u8, size) },
+                .super_arr = super_arr,
+                .main_buf = .{ .arr = super_arr[0..size] },
+                .aux_buf = .{ .arr = super_arr[size..] },
             };
         }
 
         pub fn deinit(self: Self) void {
-            self.alloc.free(self.main_buf.arr);
-            self.alloc.free(self.aux_buf.arr);
+            self.alloc.free(self.super_arr);
+        }
+
+        fn growBufs(self: *Self, new_size: usize) !void {
+            std.debug.assert(new_size * 2 > self.super_arr.len);
+
+            // allocate new, bigger super array
+            const new_big_arr = try self.alloc.alloc(u8, new_size * 2);
+            defer { self.alloc.free(self.super_arr); self.super_arr = new_big_arr; }
+
+            // copy old data
+            @memcpy(new_big_arr[0..self.main_buf.total_read], self.main_buf.arr[0..self.main_buf.total_read]);
+            @memcpy(new_big_arr[new_size..self.aux_buf.total_read],  self.aux_buf.arr[0..self.aux_buf.total_read]);
+
+            // reassign buffers into super array
+            self.main_buf.arr = new_big_arr[0..new_size];
+            self.aux_buf.arr = new_big_arr[new_size..];
+        }
+
+        fn doubleBufs(self: *Self) !void {
+            return self.growBufs(self.main_buf.arr.len * 2);
         }
 
         /// This will read a Message from the underlying Reader.
@@ -103,7 +149,7 @@ pub fn MessageReader(comptime MsgSizeT: type, comptime ReaderT: type) type {
 
             // read up to total_size
             while (true) {
-                const amt_read = try self.reader.readv(&iovecs);
+                const amt_read = try if (using_context_readv) self.reader.context.readv(&iovecs) else self.reader.readv(&iovecs);
                 if (amt_read == 0) {
                     return null;
                 }
@@ -119,6 +165,7 @@ pub fn MessageReader(comptime MsgSizeT: type, comptime ReaderT: type) type {
 
             // increase buffer sizes if we hit the limit on the aux array
             if (self.aux_buf.total_read == self.aux_buf.arr.len) {
+                if (debug) print("Doubling {} B Bufs in readToSizeVectored\n", .{ self.main_buf.arr.len });
                 try self.doubleBufs();
             }
         }
@@ -151,19 +198,11 @@ pub fn MessageReader(comptime MsgSizeT: type, comptime ReaderT: type) type {
             // if we completely filled the buffer with this read
             // increase their size to prevent not fully using read syscalls
             if (self.main_buf.total_read == self.main_buf.arr.len) {
+                if (debug) print("Doubling {} B Bufs in readToSize\n", .{ self.main_buf.arr.len });
                 try self.doubleBufs();
             }
 
             self.main_buf.total_read = total_size;
-        }
-
-        fn resizeBufs(self: *Self, new_size: usize) !void {
-            self.main_buf.arr = try self.alloc.realloc(self.main_buf.arr, new_size);
-            self.aux_buf.arr = try self.alloc.realloc(self.aux_buf.arr, new_size);
-        }
-
-        fn doubleBufs(self: *Self) !void {
-            return self.resizeBufs(self.main_buf.arr.len * 2);
         }
 
         /// Resizes the buffers to fit the message
@@ -190,7 +229,8 @@ pub fn MessageReader(comptime MsgSizeT: type, comptime ReaderT: type) type {
                 // for performance reasons (not every byte of the last read syscall is actually "being used")
                 // and of course, because we might not be able to fit the message!
                 const new_len = @max(self.main_buf.arr.len, self.total_msg_size) * 2;
-                try self.resizeBufs(new_len);
+                if (debug) print("Resizing {} B Bufs in getTotalMsgSize to {}\n", .{ self.main_buf.arr.len, new_len });
+                try self.growBufs(new_len);
             }
 
             // handle message overreading
