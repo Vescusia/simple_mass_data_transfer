@@ -5,23 +5,26 @@ const debug = std.debug.print;
 const msgio = @import("msgio.zig");
 const cryptio = @import("cryptio.zig");
 
-
-const max_msg_len = 1 << 12;
+const main = @import("main.zig");
+const proto_version = main.proto_version;
+const max_msg_len = main.max_msg_len;
 
 
 pub fn download(alloc: std.mem.Allocator) !void {
     const stream = try net.tcpConnectToHost(alloc, "127.0.0.1", 5882);
-    debug("Stream: {}\n", .{stream});
     defer stream.close();
 
     // create encrypted io
-    const encrypted_io = cryptio.EncryptedIO(max_msg_len, @TypeOf(stream), "raw_key: []const u8");
-    var writer = encrypted_io.writer(stream.writer());
+    const EncryptedIO = cryptio.EncryptedIO(max_msg_len, @TypeOf(stream), "raw_key: []const u8");
+    var writer = EncryptedIO.writer(stream.writer());
+    var reader = try EncryptedIO.reader(alloc, stream.reader());
+    defer reader.deinit();
 
-    const msg: [max_msg_len]u8 = undefined;
-
-    // write message
-    for (0..4096) |_| {
-        try writer.writeMessage(&msg);
+    // exchange version
+    debug("Using protocol version {s}\n", .{ proto_version });
+    try writer.writeMessage(proto_version);
+    if (!std.mem.eql(u8, try reader.readMessage() orelse return, proto_version)) {
+        debug("Server is using icompatible protocol version.", .{});
+        return;
     }
 }

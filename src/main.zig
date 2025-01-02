@@ -7,8 +7,9 @@ const download = @import("download.zig").download;
 const msgio = @import("msgio.zig");
 
 
-// get stdout and stdin
-
+// Declare SMD-Transfer Protocol Version
+pub const proto_version = "0.1";
+pub const max_msg_len = 1 << 12;
 
 
 pub fn main() !void {

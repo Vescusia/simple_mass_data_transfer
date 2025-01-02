@@ -5,9 +5,11 @@ const debug = std.debug.print;
 const msgio = @import("msgio.zig");
 const cryptio = @import("cryptio.zig");
 const indexing = @import("file_indexing.zig");
+const utils = @import("utils.zig");
 
-
-const max_msg_len = 1 << 12;
+const main = @import("main.zig");
+const proto_version = main.proto_version;
+const max_msg_len = main.max_msg_len;
 
 
 pub fn server(alloc: std.mem.Allocator) !void {
@@ -26,14 +28,14 @@ pub fn server(alloc: std.mem.Allocator) !void {
     defer file_index.deinit();
 
     // main loop
-    try stdout.print("Server is listening on {}!\n", .{address});
+    try stdout.print("Server is listening on {} with protocol version {s}\n", .{ address, proto_version });
     while (true)  {
         // accept client
         const client = try listener.accept();
-        try stdout.print("Client<{}> connected!\n", .{client.address});
+        try stdout.print("Client<{}> connected!\n", .{ client.address });
 
         // handle client
-        try handle_client(alloc, client);
+        try handle_client(alloc, client, file_index.items);
 
         // ask user if they want to continue
         try stdout.print("Continue? y/N > ", .{});
@@ -49,21 +51,33 @@ pub fn server(alloc: std.mem.Allocator) !void {
 
 
 /// All allocated memory will be freed by the end of this function
-fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection) !void {
+fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_index: []indexing.FileIndexEntry) !void {
     defer client.stream.close();
     defer debug("Client<{}> disconnected.\n", .{client.address});
 
     // create encrypted io
     const EncryptedStream = cryptio.EncryptedIO(max_msg_len, @TypeOf(client.stream), "raw_key: []const u8");
+    var writer = EncryptedStream.writer(client.stream.writer());
     var reader = try EncryptedStream.reader(alloc, client.stream.reader());
     defer reader.deinit();
-    debug("Using vectored reads: {}\n", .{ @TypeOf(reader).using_readv });
 
+    // starting timer
     const start = try std.time.Instant.now();
-    var msg_opt = try reader.readMessage();
-    while (msg_opt) |msg| : (msg_opt = try reader.readMessage()) {
-        _ = msg;
+
+    // exchange version
+    try writer.writeMessage(proto_version);
+    if (!std.mem.eql(u8, try reader.readMessage() orelse return, proto_version)) {
+        debug("Client is using icompatible protocol version.", .{});
+        return;
     }
-    const end = try std.time.Instant.now();
-    debug("Time taken: {}\n", .{@as(f64, @floatFromInt(end.since(start))) / @as(f64, @floatFromInt(std.time.ns_per_s))});
+
+    // receive file progress
+
+
+    // send files in index
+
+
+    // print stats
+    const elapsed: f64 = @as(f64, @floatFromInt((try std.time.Instant.now()).since(start))) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    debug("Time taken: {e} s ({e} min)\n", .{ elapsed, elapsed / 60 });
 }

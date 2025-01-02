@@ -45,12 +45,14 @@ pub fn indexFiles(alloc: std.mem.Allocator, root_dir: []const u8) !std.ArrayList
 
             switch (entry.kind) {
                 .file => {
-                    const path = PathBuf.from(real_path);
+                    const file = try fs.openFileAbsolute(real_path, file_open_options);
+                    const meta = try file.metadata();
+
                     try file_index.append(.{
-                        .path = path,
-                        .file = try fs.openFileAbsolute(real_path, file_open_options),
-                        .size = undefined,
-                        .id = undefined,
+                        .path = PathBuf.from(real_path),
+                        .file = file,
+                        .size = meta.size(),
+                        .id = FileIndexEntry.fileStatToId(entry.name, meta),
                     });
                 },
                 // add directory to stack
@@ -65,7 +67,6 @@ pub fn indexFiles(alloc: std.mem.Allocator, root_dir: []const u8) !std.ArrayList
         }
     }
 
-    std.debug.print("{}\n", .{file_index.items.len});
     return file_index;
 }
 
@@ -83,7 +84,27 @@ pub const FileIndexEntry = struct {
         _ = fmt;
         _ = options;
 
-        try std.fmt.format(writer, "('{s}': {x})\n", .{ self.path.bytes(), self.id });
+        try std.fmt.format(writer, "'{s}': {} B - {x}\n", .{ self.path.bytes(), self.size, self.id });
+    }
+
+    pub fn fileStatToId(name: []const u8, meta: fs.File.Metadata) u256 {
+        var id: u256 = @intCast(meta.created() orelse 0);
+        id |= @as(u128, @bitCast(meta.modified())) << (255 - @typeInfo(@TypeOf(meta.modified())).Int.bits);
+
+        // rotate by name len
+        const shft_amt: u8 = @intCast(@as(u256, name.len *% name.len) % 255);
+        id = (id << shft_amt) | (id >> 255 - shft_amt);
+
+        // pad/trim name into 16 byte array
+        var name_bytes: [256/8]u8 = undefined;
+        for (0..(name_bytes.len / name.len)) |copies| {
+            @memcpy(name_bytes[copies * name.len..(copies + 1) * name.len], name[0..]);
+        }
+        @memcpy(name_bytes[name_bytes.len - @min(name.len, name_bytes.len)..], name[0..@min(name.len, name_bytes.len)]);
+
+        id |= std.mem.bytesToValue(u256, &name_bytes);
+
+        return id;
     }
 };
 
