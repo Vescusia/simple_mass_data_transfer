@@ -4,6 +4,7 @@ const debug = std.debug.print;
 
 const msgio = @import("msgio.zig");
 const cryptio = @import("cryptio.zig");
+const indexing = @import("file_indexing.zig");
 
 
 const max_msg_len = 1 << 12;
@@ -21,6 +22,8 @@ pub fn server(alloc: std.mem.Allocator) !void {
     var listener = try address.listen(.{ .reuse_address = true, .reuse_port = true });
 
     // index files
+    const file_index = try indexing.indexFiles(alloc, ".");
+    defer file_index.deinit();
 
     // main loop
     try stdout.print("Server is listening on {}!\n", .{address});
