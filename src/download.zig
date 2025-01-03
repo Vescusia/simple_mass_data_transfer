@@ -15,16 +15,14 @@ pub fn download(alloc: std.mem.Allocator) !void {
     defer stream.close();
 
     // create encrypted io
-    const EncryptedIO = cryptio.EncryptedIO(max_msg_len, @TypeOf(stream), "raw_key: []const u8");
-    var writer = EncryptedIO.writer(stream.writer());
-    var reader = try EncryptedIO.reader(alloc, stream.reader());
-    defer reader.deinit();
+    var writer = cryptio.EncryptedMessageWriter(@TypeOf(stream.writer()), max_msg_len, "raw_key: []const u8")
+        .init(stream.writer());
+    // var reader = cryptio.EncryptedMessageReader(@TypeOf(stream.reader()), max_msg_len, "raw_key: []const u8")
+       // .init(stream.reader());
 
     // exchange version
-    debug("Using protocol version {s}\n", .{ proto_version });
-    try writer.writeMessage(proto_version);
-    if (!std.mem.eql(u8, try reader.readMessage() orelse return, proto_version)) {
-        debug("Server is using icompatible protocol version.", .{});
-        return;
+    const msg: [max_msg_len]u8 = undefined;
+    for (0..128) |_| {
+        try writer.writeMessage(&msg);
     }
 }

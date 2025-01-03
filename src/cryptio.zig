@@ -8,163 +8,235 @@ const msgio = @import("msgio.zig");
 const ad: [0]u8 = undefined;
 
 
-/// Creates a XChaCha20Poly1305 encrypted File from an underlying File.
-///
-/// It is absolutely crucial that both communicating Partners use the same `max_msg_len`!.
-/// Otherwise Communication will not be possible.
-///
-/// * `max_msg_len`: the maximum length (in bytes) of the sent messages;
-/// it is UB if these boundaries are exceeded!
-/// Also, this directly controls the length of the Cipher Buffers (on Stack), so it should be kept somewhat small.
-/// (but big enough to not get overly many `writeMessage`/`readMessage` calls, along their overhead)
-/// * `file`: the underlying IO object; must have `.reader()` and `.writer()` implemented.
-/// * `key`: does not need to be padded, will be done internally
-pub fn EncryptedIO(max_msg_len: usize, FileT: type, key: []const u8) type {
-    // construct the type of the underlying Writer and Reader
-    const WriterT = @typeInfo(@TypeOf(FileT.writer)).Fn.return_type.?;
-    const ReaderT = @typeInfo(@TypeOf(FileT.reader)).Fn.return_type.?;
+pub fn EncryptedMessageReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) type {
+    const MsgSizeT = SmallestInt(max_msg_size);
+    const msg_size_size = @sizeOf(MsgSizeT);
 
-    // construct the type of the encrypted Writer and Reader
-    const EncryptedWriterT = EncryptedWriter(max_msg_len, WriterT);
-    const EncryptedReaderT = EncryptedReader(max_msg_len, ReaderT);
+    const block_header_size = chacha.nonce_length + chacha.tag_length + msg_size_size;
 
-    std.debug.assert(EncryptedWriterT.MsgSizeT == EncryptedReaderT.MsgSizeT);
+    const padded_key = padKey(raw_key);
 
     return struct {
-        pub const MsgSizeT = EncryptedWriterT.MsgSizeT;
+        block_buf: [block_header_size + msg_size_size + max_msg_size]u8 = undefined,
+        block_end: MsgSizeT = undefined,
+        block_read: usize = 0,
+        content_buf: [(max_msg_size + msg_size_size) * 2]u8 = undefined,
+        content_end: usize = 0,
+        content_start: usize = 0,
+        reader: ReaderT,
 
-        pub fn writer(underlying_writer: WriterT) EncryptedWriterT {
-            return EncryptedWriterT.init(underlying_writer, key);
+        const Self = @This();
+
+        pub fn init(reader: ReaderT) Self {
+            return Self {
+                .reader = reader,
+            };
         }
 
-        /// Caller has to `.deinit()` to deallocate the memory
-        pub fn reader(alloc: std.mem.Allocator, underlying_reader: ReaderT) !EncryptedReaderT {
-            return EncryptedReaderT.init(alloc, underlying_reader, key);
+        /// Reads a new block into the block buffer,
+        /// decrypts it into the second half of the content buffer,
+        /// after shifting the already present content directly in front of it,
+        /// into the first half such that the content remains contiguous
+        fn refillContentBuf(self: *Self) !?void {
+            // copy first part of message to into first half of content buffer
+            @memcpy(self.content_buf[max_msg_size - self.contentLeft()..max_msg_size], self.content_buf[self.content_start..self.content_end]);
+            self.content_start = max_msg_size - self.contentLeft();
+
+            // read new block into block buffer
+            try self.readBlock() orelse return null;
+
+            // decrypt it into second half of content buffer
+            try self.decryptBlock();
+        }
+
+        /// Will completely renew current block state
+        fn readBlock(self: *Self) !?void {
+            // handle block overreading of previous call and reset self.block_read
+            if (self.block_read > self.block_end) {
+                std.mem.copyForwards(u8,
+                    self.block_buf[0..self.block_read - self.block_end],
+                    self.block_buf[self.block_end..self.block_read]
+                );
+                self.block_read -= self.block_end;
+            }
+            else {
+                self.block_read = 0;
+            }
+
+            // read the block crypto header into buffer
+            while (self.block_read < block_header_size) {
+                const new_read = try self.reader.read(self.block_buf[self.block_read..]);
+                if (new_read == 0) {
+                    return null;
+                }
+                self.block_read += new_read;
+            }
+
+            // read the block size
+            const raw_block_size = std.mem.bytesToValue(MsgSizeT, self.block_buf[0..msg_size_size]);
+            self.block_end = std.mem.bigToNative(MsgSizeT, raw_block_size) + block_header_size;
+            std.debug.assert(self.block_end <= self.block_buf.len);
+
+            // fill up block buffer
+            while (self.block_read < self.block_end) {
+                const new_read = try self.reader.read(self.block_buf[self.block_read..]);
+                if (new_read == 0) {
+                    return null;
+                }
+                self.block_read += new_read;
+            }
+        }
+
+        /// Decrypts block buffer into second half of content buffer
+        fn decryptBlock(self: *Self) !void {
+            const nonce = self.block_buf[msg_size_size..msg_size_size + chacha.nonce_length];
+            const tag = self.block_buf[msg_size_size + chacha.nonce_length..block_header_size];
+            const crypted = self.block_buf[block_header_size..self.block_end];
+
+            self.content_end = max_msg_size + self.block_end - block_header_size;
+
+            try chacha.decrypt(
+                self.content_buf[max_msg_size..self.content_end],
+                crypted,
+                tag.*,
+                &ad,
+                nonce.*,
+                padded_key
+            );
+        }
+
+        fn contentLeft(self: Self) usize {
+            return self.content_end - self.content_start;
+        }
+
+        /// Reads a message from the encrypted underlying reader.
+        pub fn readMessage(self: *Self) !?[]u8 {
+            // fill content buffer if it's basically empty
+            while (self.contentLeft() < msg_size_size) {
+                try self.refillContentBuf() orelse return null;
+            }
+
+            // extract message size
+            const msg_size = std.mem.bigToNative(MsgSizeT, std.mem.bytesToValue(MsgSizeT, self.content_buf[self.content_start..self.content_start + msg_size_size]));
+            self.content_start += msg_size_size;
+
+            //std.debug.print("MsgSizeReceived: {d}\n", .{msg_size});
+            std.debug.assert(msg_size <= max_msg_size);
+
+            // refill the content buffer if we do not have enough content
+            while (msg_size > self.contentLeft()) {
+                try self.refillContentBuf() orelse return null;
+            }
+
+            // extract message
+            const message = self.content_buf[self.content_start..self.content_start + msg_size];
+            self.content_start += msg_size;
+
+            return message;
         }
     };
 }
 
 
-/// It is absolutely crucial that both Writer and Reader have the same `max_msg_len`.
-/// Otherwise, behavior is undefined!
-pub fn EncryptedWriter(max_msg_len: usize, WriterT: type) type {
-    // create integer with nonce length bits
+pub fn EncryptedMessageWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) type {
+    const MsgSizeT = SmallestInt(max_msg_size);
+    const msg_size_size = @sizeOf(MsgSizeT);
+
+    const padded_key = padKey(raw_key);
+
+    // integer type with nonce length size
     const NonceIntT = @Type(.{
         .Int = .{ .signedness = .unsigned, .bits = chacha.nonce_length * 8 }
     });
 
+    const block_header_size = chacha.nonce_length + chacha.tag_length + msg_size_size;
+
     return struct {
-        msgwriter: MsgWriterT,
-        key: [chacha.key_length] u8,
-        buf: [total_max_msg_len]u8,
-        // incrementing, initially random nonce
+        block_buf: [block_header_size + msg_size_size + max_msg_size]u8 = undefined,
+        write_buf: [msg_size_size + max_msg_size]u8 = undefined,
+        start: usize = 0,
         nonce: [chacha.nonce_length]u8,
-
-        pub const total_max_msg_len = chacha.nonce_length + chacha.tag_length + max_msg_len;
-
-        pub const MsgSizeT = SmallestInt(total_max_msg_len + chacha.nonce_length + chacha.tag_length);
-        const MsgWriterT = msgio.MessageWriter(MsgSizeT, WriterT);
+        writer: WriterT,
 
         const Self = @This();
 
-        pub fn init(writer: WriterT, key: []const u8) Self {
+        pub fn init(writer: WriterT) Self {
+            var nonce: [chacha.nonce_length]u8 = undefined;
+            std.crypto.random.bytes(&nonce);
+
             return .{
-                .msgwriter = msgio.MessageWriter(MsgSizeT, WriterT).init(writer),
-                .key = padKey(key),
-                .buf = std.mem.zeroes([total_max_msg_len]u8),
-                .nonce = blk: {
-                    var nonce: [chacha.nonce_length]u8 = undefined;
-                    std.crypto.random.bytes(&nonce);
-                    break :blk nonce;
-                },
+                .nonce = nonce,
+                .writer = writer
             };
         }
 
-        /// Write an encrypted Message
-        ///
-        /// All memory allocated with `alloc` will be freed before this method returns.
+        /// Write a message into the buffer
         pub fn writeMessage(self: *Self, content: []const u8) !void {
-            // increment nonce
-            const new_nonce = std.mem.bytesToValue(NonceIntT, &self.nonce) +% 1;
-            self.nonce = std.mem.bytesToValue(@TypeOf(self.nonce), std.mem.asBytes(&new_nonce));
+            std.debug.assert(content.len <= max_msg_size);
 
-            // tag (will get filled by encrypt)
+            // flush the buffer if full
+            if (self.bufSpaceLeft() < msg_size_size + content.len) {
+                try self.flush();
+            }
+
+            // add message size
+            const msg_size = std.mem.asBytes(&std.mem.nativeToBig(MsgSizeT, @truncate(content.len)));
+            @memcpy(self.write_buf[self.start..self.start + msg_size_size], msg_size);
+            self.start += msg_size_size;
+
+            // copy in content
+            @memcpy(self.write_buf[self.start..self.start + content.len], content);
+            self.start += content.len;
+        }
+
+        pub fn bufSpaceLeft(self: Self) usize {
+            return self.write_buf.len - self.start;
+        }
+
+        /// Flush the buffer,
+        /// writing the encrpyted messages upon the underlying writer
+        pub fn flush(self: *Self) !void {
+            try self.directWriteMessage(self.write_buf[0..self.start]);
+            self.start = 0;
+        }
+
+        /// Directly write and encrypt a message, instantly flushing it.
+        ///
+        /// This will be more performant than calling `writeMessage` and then `flush`.
+        pub fn directWriteMessage(self: *Self, content: []const u8) !void {
+            // copy in nonce
+            @memcpy(self.block_buf[msg_size_size..msg_size_size + chacha.nonce_length], &self.nonce);
+            defer std.mem.bytesAsValue(NonceIntT, &self.nonce).* +%= 1;
+
+            // copy in block size
+            @memcpy(
+                self.block_buf[0..msg_size_size],
+                std.mem.asBytes(&std.mem.nativeToBig(MsgSizeT, @truncate(content.len)))
+            );
+
+            // calculate tag
             var tag: [chacha.tag_length]u8 = undefined;
 
-            // ensure that message fits into buffer (and msg_size_t)
-            std.debug.assert(chacha.nonce_length + tag.len + content.len <= total_max_msg_len);
-
-            // encrypt into self.buf
-            chacha.encrypt(self.buf[0..content.len], &tag, content, &ad, self.nonce, self.key);
-
-            // write
-            const parts = [_][]const u8 {
-                &self.nonce,
+            // encrypt in content
+            chacha.encrypt(
+                self.block_buf[block_header_size..content.len + block_header_size],
                 &tag,
-                self.buf[0..content.len]
-            };
-            try self.msgwriter.writeMultiple(parts.len, parts);
-        }
-    };
-}
+                content,
+                &ad,
+                self.nonce,
+                padded_key
+            );
 
+            // copy in tag
+            @memcpy(self.block_buf[msg_size_size + chacha.nonce_length..block_header_size], &tag);
 
-/// It is absolutely crucial that both Writer and Reader have the same `max_msg_len`.
-/// Otherwise, behavior is undefined!
-pub fn EncryptedReader(max_msg_len: usize, ReaderT: type) type {
-    return struct {
-        msgreader: MsgReaderT,
-        key: [chacha.key_length] u8,
-        buf: [total_max_msg_len]u8,
-
-        /// This is the total maximum length used internally, which includes the nonce, tag and message itself
-        pub const total_max_msg_len = chacha.nonce_length + chacha.tag_length + max_msg_len;
-
-        const MsgReaderT = msgio.MessageReader(MsgSizeT, ReaderT);
-        pub const MsgSizeT = SmallestInt(total_max_msg_len + chacha.nonce_length + chacha.tag_length);
-
-        /// Will be true if the `EncryptedReader` is using vectored Reads.
-        /// Not using vectored Reads will (probably) result in a small performance reduction.
-        ///
-        /// If this returns `false`, consider using an underlying Reader that implements `readv`.
-        pub const using_readv = MsgReaderT.using_readv;
-
-        const Self = @This();
-
-        /// Call `deinit` to free memory
-        pub fn init(alloc: std.mem.Allocator, reader: ReaderT, key: []const u8) !Self {
-            return .{
-                .msgreader = try msgio.MessageReader(MsgSizeT, ReaderT).init(alloc, reader),
-                .key = padKey(key),
-                .buf = undefined,
-            };
-        }
-
-        pub fn deinit(self: Self) void {
-            self.msgreader.deinit();
-        }
-
-        /// **Returned slice will be valid until this function is called again.**
-        pub fn readMessage(self: *Self) !?[]u8 {
-            // get whole message
-            const everything = try self.msgreader.readMessage() orelse return null;
-
-            // ensure that message fits into buffer
-            std.debug.assert(everything.len <= total_max_msg_len);
-
-            // extract nonce
-            const nonce = everything[0..chacha.nonce_length];
-
-            // extract tag
-            const tag = everything[nonce.len..nonce.len + chacha.tag_length];
-
-            // extract encrypted data
-            const crypted = everything[nonce.len + tag.len..];
-
-            // decrypt
-            try chacha.decrypt(self.buf[0..crypted.len], crypted, tag.*, &ad, nonce.*, self.key);
-
-            return self.buf[0..crypted.len];
+            // write complete block buffer
+            const total_block_size = block_header_size + content.len;
+            var amt_written: usize = 0;
+            while (amt_written < total_block_size) {
+                const new_written = try self.writer.write(self.block_buf[amt_written..total_block_size]);
+                amt_written += new_written;
+            }
         }
     };
 }
@@ -200,9 +272,4 @@ test "pad_key" {
     const text = "ZATY";
     const padded = padKey(text);
     try std.testing.expect(std.mem.eql(u8, &padded, "ZATYZATYZATYZATYZATYZATYZATYZATYZATYZATYZATYZATY"[0..chacha.key_length]));
-}
-
-
-test {
-    _ = EncryptedWriter;
 }

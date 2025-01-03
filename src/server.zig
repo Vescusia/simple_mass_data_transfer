@@ -56,19 +56,22 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
     defer debug("Client<{}> disconnected.\n", .{client.address});
 
     // create encrypted io
-    const EncryptedStream = cryptio.EncryptedIO(max_msg_len, @TypeOf(client.stream), "raw_key: []const u8");
-    var writer = EncryptedStream.writer(client.stream.writer());
-    var reader = try EncryptedStream.reader(alloc, client.stream.reader());
-    defer reader.deinit();
+    const writer = cryptio.EncryptedMessageWriter(@TypeOf(client.stream.writer()), max_msg_len, "raw_key: []const u8")
+        .init(client.stream.writer());
+    var reader = cryptio.EncryptedMessageReader(@TypeOf(client.stream.reader()), max_msg_len, "raw_key: []const u8")
+        .init(client.stream.reader());
 
     // starting timer
     const start = try std.time.Instant.now();
 
+    _ = alloc;
+    _ = writer;
+    _ = file_index;
+
     // exchange version
-    try writer.writeMessage(proto_version);
-    if (!std.mem.eql(u8, try reader.readMessage() orelse return, proto_version)) {
-        debug("Client is using icompatible protocol version.", .{});
-        return;
+    var msg_opt = try reader.readMessage();
+    while (msg_opt) |msg| : (msg_opt = try reader.readMessage()) {
+        _ = msg;
     }
 
     // receive file progress
