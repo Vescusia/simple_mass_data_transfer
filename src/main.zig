@@ -1,15 +1,13 @@
 const std = @import("std");
-const debug = std.debug.print;
-
+const builtin = @import("builtin");
 
 const server = @import("server.zig").server;
 const download = @import("download.zig").download;
-const msgio = @import("msgio.zig");
 
 
 // Declare SMD-Transfer Protocol Version
-pub const proto_version = "0.1";
-pub const max_msg_len = 1 << 12;
+pub const proto_version: u8 = 0;
+pub const max_msg_len = 1 << 20;
 
 
 pub fn main() !void {
@@ -23,21 +21,21 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
 
     if (args.len < 2) {
-        debug("Please add a command!\n", .{});
+        std.debug.print("Please add a command!\n", .{});
         return error.InvalidUsage;
     }
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "host")) {
-        debug("HOSTING\n", .{});
+        std.debug.print("HOSTING\n\n", .{});
         return server(alloc);
     }
     else if (std.mem.eql(u8, cmd, "dl")) {
-        debug("DOWNLOADING\n", .{});
+        std.debug.print("DOWNLOADING\n\n", .{});
         return download(alloc);
     }
     else {
-        debug("Please use either 'host' or 'dl'!\n", .{});
+        std.debug.print("Please use either 'host' or 'dl'!\n", .{});
         return error.InvalidArguments;
     }
 }

@@ -19,10 +19,11 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
         mutex: Mutex = Mutex{},
         write_update: Condition = Condition{},
         read_update: Condition = Condition{},
+        alloc: std.heap.ArenaAllocator,
 
 
         const Buffer = struct {
-            arr: [arr_len]u8,
+            arr: []u8,
             written: usize,
         };
 
@@ -33,15 +34,29 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
         ///
         /// Use `cycleWriter()` and `cycleReader()` to interact with the Buffers.
         ///
-        /// The Caller of this Function must also be the Writer.
-        pub fn init() Super {
+        /// Call `deinit` to deallocate the memory allocated by this function.
+        pub fn init(alloc: std.mem.Allocator) !Super {
+            // wrap in ArenaAllocator
+            var arena_alloc = std.heap.ArenaAllocator.init(alloc);
+
+            // create buffers
+            var buffers: [buffer_amt]Buffer = undefined;
+            for (&buffers) |*buf| {
+                buf.arr = try arena_alloc.allocator().alloc(u8, arr_len);
+            }
+
             return Super{
-                .buffers = undefined,
+                .buffers = buffers,
+                .alloc = arena_alloc
             };
         }
 
+        pub fn deinit(self: Super) void {
+            self.alloc.deinit();
+        }
 
-        const CycleWriter = struct {
+
+        pub const CycleWriter = struct {
             super: *Super,
             written: usize = 0,
             write: *[arr_len]u8 = undefined,
@@ -53,14 +68,14 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
             /// Returns a Pointer to the Buffered Array.
             ///
             /// Will **not** block.
-            pub fn startWrite(self: *Self) *[arr_len]u8 {
+            pub fn startWrite(self: *Self) []u8 {
                 const super = self.super;
 
                 super.mutex.lock();
                 defer super.mutex.unlock();
 
                 // return buffer
-                return &super.buffers[super.writer_i].arr;
+                return super.buffers[super.writer_i].arr;
             }
 
             /// Finish a Write, advancing to the next Buffer
@@ -98,7 +113,7 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
         }
 
 
-        const CycleReader = struct {
+        pub const CycleReader = struct {
             super: *Super,
             reader_i: usize = 0,
 
@@ -127,11 +142,15 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
 
             /// Finish a Read, advancing to the next Buffer
             /// and allowing the Writer to overwrite this one
+            ///
+            /// Will **not** block.
             pub fn finishRead(self: *Self) void {
                 const super = self.super;
 
                 super.mutex.lock();
                 defer super.mutex.unlock();
+
+                // maybe dynamically resize the buffers?
 
                 // move to next Buffer
                 super.reader_i = (super.reader_i + 1) % buffer_amt;
@@ -152,7 +171,8 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
 
 
 test "basic functionality" {
-    var cycle_bufs = CycleBuffers(3, 16).init();
+    var cycle_bufs = try CycleBuffers(3, 16).init(std.testing.allocator);
+    defer cycle_bufs.deinit();
     var writer = cycle_bufs.cycleWriter();
     var reader = cycle_bufs.cycleReader();
 
@@ -176,7 +196,8 @@ test "basic functionality" {
 }
 
 test {
-    var buf = CycleBuffers(8, 1 << 16).init();
+    var buf = try CycleBuffers(8, 1 << 16).init(std.testing.allocator);
+    defer buf.deinit();
     _ = buf.cycleWriter();
     _ = buf.cycleReader();
 }

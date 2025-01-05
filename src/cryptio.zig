@@ -2,13 +2,11 @@ const std = @import("std");
 
 const chacha = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
-const msgio = @import("msgio.zig");
-
 
 const ad: [0]u8 = undefined;
 
 
-pub fn EncryptedMessageReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) type {
+pub fn EncryptedReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) type {
     const MsgSizeT = SmallestInt(max_msg_size);
     const msg_size_size = @sizeOf(MsgSizeT);
 
@@ -39,7 +37,10 @@ pub fn EncryptedMessageReader(ReaderT: type, max_msg_size: u64, raw_key: []const
         /// into the first half such that the content remains contiguous
         fn refillContentBuf(self: *Self) !?void {
             // copy first part of message to into first half of content buffer
-            @memcpy(self.content_buf[max_msg_size - self.contentLeft()..max_msg_size], self.content_buf[self.content_start..self.content_end]);
+            @memcpy(
+                self.content_buf[max_msg_size - self.contentLeft()..max_msg_size],
+                self.content_buf[self.content_start..self.content_end]
+            );
             self.content_start = max_msg_size - self.contentLeft();
 
             // read new block into block buffer
@@ -77,6 +78,10 @@ pub fn EncryptedMessageReader(ReaderT: type, max_msg_size: u64, raw_key: []const
             self.block_end = std.mem.bigToNative(MsgSizeT, raw_block_size) + block_header_size;
             std.debug.assert(self.block_end <= self.block_buf.len);
 
+            if (self.block_end < max_msg_size - block_header_size) {
+                std.debug.print("Read {} {} B Block\n", .{ raw_block_size - block_header_size, max_msg_size });
+            }
+
             // fill up block buffer
             while (self.block_read < self.block_end) {
                 const new_read = try self.reader.read(self.block_buf[self.block_read..]);
@@ -109,36 +114,52 @@ pub fn EncryptedMessageReader(ReaderT: type, max_msg_size: u64, raw_key: []const
             return self.content_end - self.content_start;
         }
 
+        /// Ensure that at least `space` valid bytes are in `self.content_buf`
+        fn ensureContent(self: *Self, space: usize) !?void {
+            while (self.contentLeft() < space) {
+                try self.refillContentBuf() orelse return null;
+            }
+        }
+
         /// Reads a message from the encrypted underlying reader.
         pub fn readMessage(self: *Self) !?[]u8 {
             // fill content buffer if it's basically empty
-            while (self.contentLeft() < msg_size_size) {
-                try self.refillContentBuf() orelse return null;
-            }
+            try self.ensureContent(msg_size_size) orelse return null;
 
             // extract message size
             const msg_size = std.mem.bigToNative(MsgSizeT, std.mem.bytesToValue(MsgSizeT, self.content_buf[self.content_start..self.content_start + msg_size_size]));
             self.content_start += msg_size_size;
 
-            //std.debug.print("MsgSizeReceived: {d}\n", .{msg_size});
             std.debug.assert(msg_size <= max_msg_size);
 
             // refill the content buffer if we do not have enough content
-            while (msg_size > self.contentLeft()) {
-                try self.refillContentBuf() orelse return null;
-            }
+            try self.ensureContent(msg_size) orelse return null;
+            defer self.content_start += msg_size;
 
             // extract message
             const message = self.content_buf[self.content_start..self.content_start + msg_size];
-            self.content_start += msg_size;
 
             return message;
+        }
+
+        /// Reads a raw integer from the buffer.
+        ///
+        /// See `EncryptedWriter.putInt`
+        pub fn readInt(self: *Self, IntT: type) !?IntT {
+            std.debug.assert(IntT != usize);
+
+            try self.ensureContent(@sizeOf(IntT)) orelse return null;
+            defer self.content_start += @sizeOf(IntT);
+
+            const int_bytes = self.content_buf[self.content_start..self.content_start + @sizeOf(IntT)];
+
+            return std.mem.bigToNative(IntT, std.mem.bytesToValue(IntT, int_bytes));
         }
     };
 }
 
 
-pub fn EncryptedMessageWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) type {
+pub fn EncryptedWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) type {
     const MsgSizeT = SmallestInt(max_msg_size);
     const msg_size_size = @sizeOf(MsgSizeT);
 
@@ -170,14 +191,12 @@ pub fn EncryptedMessageWriter(WriterT: type, max_msg_size: u64, raw_key: []const
             };
         }
 
-        /// Write a message into the buffer
+        /// Write a message (i.e. a ) into the buffer
         pub fn writeMessage(self: *Self, content: []const u8) !void {
             std.debug.assert(content.len <= max_msg_size);
 
             // flush the buffer if full
-            if (self.bufSpaceLeft() < msg_size_size + content.len) {
-                try self.flush();
-            }
+            try self.ensureSpace(msg_size_size + content.len);
 
             // add message size
             const msg_size = std.mem.asBytes(&std.mem.nativeToBig(MsgSizeT, @truncate(content.len)));
@@ -196,22 +215,25 @@ pub fn EncryptedMessageWriter(WriterT: type, max_msg_size: u64, raw_key: []const
         /// Flush the buffer,
         /// writing the encrpyted messages upon the underlying writer
         pub fn flush(self: *Self) !void {
-            try self.directWriteMessage(self.write_buf[0..self.start]);
-            self.start = 0;
-        }
+            if (self.start < max_msg_size + msg_size_size) {
+                std.debug.print("flushing {} of {} B\n", .{ self.start, max_msg_size });
+            }
 
-        /// Directly write and encrypt a message, instantly flushing it.
-        ///
-        /// This will be more performant than calling `writeMessage` and then `flush`.
-        pub fn directWriteMessage(self: *Self, content: []const u8) !void {
+            // increment nonce
+            std.mem.writePackedInt(
+                NonceIntT, &self.nonce, 0, std.mem.bytesToValue(NonceIntT, &self.nonce) +% 1, .big
+            );
+
             // copy in nonce
-            @memcpy(self.block_buf[msg_size_size..msg_size_size + chacha.nonce_length], &self.nonce);
-            defer std.mem.bytesAsValue(NonceIntT, &self.nonce).* +%= 1;
+            @memcpy(
+                self.block_buf[msg_size_size..msg_size_size + chacha.nonce_length],
+                &self.nonce
+            );
 
             // copy in block size
             @memcpy(
                 self.block_buf[0..msg_size_size],
-                std.mem.asBytes(&std.mem.nativeToBig(MsgSizeT, @truncate(content.len)))
+                std.mem.asBytes(&std.mem.nativeToBig(MsgSizeT, @truncate(self.start)))
             );
 
             // calculate tag
@@ -219,24 +241,60 @@ pub fn EncryptedMessageWriter(WriterT: type, max_msg_size: u64, raw_key: []const
 
             // encrypt in content
             chacha.encrypt(
-                self.block_buf[block_header_size..content.len + block_header_size],
+                self.block_buf[block_header_size..self.start + block_header_size],
                 &tag,
-                content,
+                self.write_buf[0..self.start],
                 &ad,
                 self.nonce,
                 padded_key
             );
+            defer self.start = 0;
 
             // copy in tag
-            @memcpy(self.block_buf[msg_size_size + chacha.nonce_length..block_header_size], &tag);
+            @memcpy(
+                self.block_buf[msg_size_size + chacha.nonce_length..block_header_size],
+                &tag
+            );
 
             // write complete block buffer
-            const total_block_size = block_header_size + content.len;
+            const total_block_size = block_header_size + self.start;
             var amt_written: usize = 0;
             while (amt_written < total_block_size) {
                 const new_written = try self.writer.write(self.block_buf[amt_written..total_block_size]);
                 amt_written += new_written;
             }
+        }
+
+        /// Write a message and instantly flush it.
+        pub fn directWriteMessage(self: *Self, content: []const u8) !void {
+            try self.writeMessage(content);
+            return self.flush();
+        }
+
+        /// Ensure that at least `space` free bytes are in `self.write_buf`
+        fn ensureSpace(self: *Self, space: usize) !void {
+            if (self.bufSpaceLeft() < space) {
+                try self.flush();
+            }
+        }
+
+        /// Write a raw integer into the buffer.
+        ///
+        /// This is not a message.
+        /// And must be read from the `EncryptedReader` using `readInt` with the same type.
+        ///
+        /// Endianness is handled under the hood.
+        pub fn putInt(self: *Self, int: anytype) !void {
+            const IntT = @TypeOf(int);
+            std.debug.assert(IntT != usize);
+
+            try self.ensureSpace(@sizeOf(IntT));
+            defer self.start += @sizeOf(IntT);
+
+            @memcpy(
+                self.write_buf[self.start..self.start + @sizeOf(IntT)],
+                std.mem.asBytes(&std.mem.nativeToBig(IntT, int))
+            );
         }
     };
 }

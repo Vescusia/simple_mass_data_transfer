@@ -6,8 +6,15 @@ const builtin = @import("builtin");
 pub const max_path_len = 1 << 14;
 
 
-pub fn indexFiles(alloc: std.mem.Allocator, root_dir: []const u8) !std.ArrayList(FileIndexEntry) {
-    std.debug.assert(root_dir.len > 0);
+/// Assumes that `root_dir` is absolute.
+pub fn indexFiles(alloc: std.mem.Allocator, raw_root_dir: []const u8) !std.ArrayList(FileIndexEntry) {
+    std.debug.assert(raw_root_dir.len > 0);
+    std.debug.assert(fs.path.isAbsolute(raw_root_dir));
+
+    var root_dir = PathBuf.from(raw_root_dir);
+    if (!root_dir.lastIsSlash()) {
+        root_dir.addSlash();
+    }
 
     // create list of directories to explore
     var dir_stack = std.ArrayList(struct { dir: fs.Dir, path: PathBuf }).init(alloc);
@@ -20,14 +27,10 @@ pub fn indexFiles(alloc: std.mem.Allocator, root_dir: []const u8) !std.ArrayList
     const dir_open_options: fs.Dir.OpenDirOptions = .{ .iterate = true };
     const file_open_options: fs.File.OpenFlags = .{ .mode = .read_only, .lock = .none };
 
-    // get initial directory
-    const real_root_dir = try fs.realpathAlloc(alloc, root_dir);
-    defer alloc.free(real_root_dir);
-
     // add initial directory
     try dir_stack.append(.{
-        .dir = try fs.openDirAbsolute(real_root_dir, dir_open_options),
-        .path = PathBuf.from(real_root_dir)
+        .dir = try fs.openDirAbsolute(root_dir.bytes(), dir_open_options),
+        .path = root_dir
     });
 
     // crawl directories
@@ -36,7 +39,10 @@ pub fn indexFiles(alloc: std.mem.Allocator, root_dir: []const u8) !std.ArrayList
         var curr_dir = dir_stack.pop();
         defer curr_dir.dir.close();
 
-        curr_dir.path.addSlash();
+        // turn into actual directory path
+        if (!curr_dir.path.lastIsSlash()) {
+            curr_dir.path.addSlash();
+        }
 
         // iterate over files
         var dir_iter = curr_dir.dir.iterate();
@@ -47,9 +53,10 @@ pub fn indexFiles(alloc: std.mem.Allocator, root_dir: []const u8) !std.ArrayList
                 .file => {
                     const file = try fs.openFileAbsolute(real_path, file_open_options);
                     const meta = try file.metadata();
+                    var path = PathBuf.from(real_path);
 
                     try file_index.append(.{
-                        .path = PathBuf.from(real_path),
+                        .path = path.relativize(root_dir.bytes()),
                         .file = file,
                         .size = meta.size(),
                         .id = FileIndexEntry.fileStatToId(entry.name, meta),
@@ -57,11 +64,11 @@ pub fn indexFiles(alloc: std.mem.Allocator, root_dir: []const u8) !std.ArrayList
                 },
                 // add directory to stack
                 .directory => {
-                    try dir_stack.append(.{
-                        .dir = try fs.openDirAbsolute(real_path, dir_open_options),
-                        .path = PathBuf.from(real_path)
-                    });
-                },
+                try dir_stack.append(.{
+                    .dir = try fs.openDirAbsolute(real_path, dir_open_options),
+                    .path = PathBuf.from(real_path)
+                });
+            },
                 else => { }
             }
         }
@@ -75,7 +82,7 @@ pub const FileIndexEntry = struct {
     path: PathBuf,
     file: fs.File,
     id: u256,
-    size: usize,
+    size: u64,
     lock: std.Thread.Mutex = undefined,
 
     const Self = @This();
@@ -109,7 +116,7 @@ pub const FileIndexEntry = struct {
 };
 
 
-const PathBuf = struct {
+pub const PathBuf = struct {
     path_buf: [max_path_len]u8,
     base_len: usize,
 
@@ -123,7 +130,7 @@ const PathBuf = struct {
 
         return .{
             .path_buf = path_buf,
-            .base_len = path.len
+            .base_len = path.len,
         };
     }
 
@@ -138,7 +145,7 @@ const PathBuf = struct {
         self.base_len += 1;
     }
 
-    pub fn bytes(self: Self) []const u8 {
+    pub fn bytes(self: *const Self) []const u8 {
         return self.path_buf[0..self.base_len];
     }
 
@@ -148,5 +155,32 @@ const PathBuf = struct {
 
         @memcpy(self.path_buf[self.base_len..total_len], name);
         return self.path_buf[0..total_len];
+    }
+
+    /// Cuts of `parent` from `self`.
+    /// Assumes that `parent` is a a part of `self`
+    pub fn relativize(self: *Self, parent: []const u8) Self {
+        const up_to = @min(self.base_len, parent.len);
+
+        // calculate up to which character the paths match
+        const match_to =
+            for (0.., self.path_buf[0..up_to], parent[0..up_to]) |i, self_char, parent_char| {
+                if (self_char != parent_char) {
+                    break i;
+                }
+            } else up_to;
+
+        // copy the remaining bytes to the front
+        const remaining_len = self.base_len - match_to;
+        std.mem.copyForwards(u8, self.path_buf[0..remaining_len], self.path_buf[match_to..self.base_len]);
+        self.base_len = remaining_len;
+
+        return self.*;
+    }
+
+    /// Asserts that `self` contains at least one character.
+    pub fn lastIsSlash(self: Self) bool {
+        const last = self.path_buf[self.base_len - 1];
+        return last == '/' or last == '\\';
     }
 };
