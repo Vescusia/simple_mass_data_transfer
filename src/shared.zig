@@ -1,0 +1,40 @@
+const std = @import("std");
+
+const main = @import("main.zig");
+const indexing = @import("file_indexing.zig");
+const cryptio = @import("cryptio.zig");
+
+
+/// Writer will **not** be explicitly flushed within this function
+pub fn writeFileIndex(msg_writer: anytype, file_index: indexing.FileIndex) !void {
+    // send file index length
+    try msg_writer.putInt(@as(u64, file_index.files().len));
+
+    // send files
+    for (file_index.files()) |file| {
+        try msg_writer.putInt(file.id);
+        try msg_writer.putInt(@as(u64, file.size));
+        try msg_writer.writeMessage(file.path.bytes());
+    }
+}
+
+/// The files in the returned `FileIndex` will **not** be open
+///
+/// File index needs to be deallocated using `deinit`
+pub fn readFileIndex(alloc: std.mem.Allocator, msg_reader: anytype) !?indexing.FileIndex {
+    // receive file index length
+    const index_len = try msg_reader.readInt(u64) orelse return null;
+    var file_index = try indexing.FileIndex.initCapacity(alloc, @as(usize, index_len));
+
+    // receive files
+    for (0..index_len) |_| {
+        try file_index.rawAdd(.{
+            .id = try msg_reader.readInt(u256) orelse return null,
+            .size = try msg_reader.readInt(u64) orelse return null,
+            .path = indexing.PathBuf.from(try msg_reader.readMessage() orelse return null),
+            .file = undefined,
+        });
+    }
+
+    return file_index;
+}

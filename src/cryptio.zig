@@ -15,7 +15,7 @@ pub fn EncryptedReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) ty
     const padded_key = padKey(raw_key);
 
     return struct {
-        block_buf: [block_header_size + msg_size_size + max_msg_size]u8 = undefined,
+        block_buf: [block_header_size + max_block_size]u8 = undefined,
         block_end: MsgSizeT = undefined,
         block_read: usize = 0,
         content_buf: [(max_msg_size + msg_size_size) * 2]u8 = undefined,
@@ -23,6 +23,7 @@ pub fn EncryptedReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) ty
         content_start: usize = 0,
         reader: ReaderT,
 
+        pub const max_block_size = msg_size_size + max_msg_size;
         const Self = @This();
 
         pub fn init(reader: ReaderT) Self {
@@ -54,6 +55,7 @@ pub fn EncryptedReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) ty
         fn readBlock(self: *Self) !?void {
             // handle block overreading of previous call and reset self.block_read
             if (self.block_read > self.block_end) {
+                std.debug.print("Block overreading!\n", .{});
                 std.mem.copyForwards(u8,
                     self.block_buf[0..self.block_read - self.block_end],
                     self.block_buf[self.block_end..self.block_read]
@@ -78,8 +80,8 @@ pub fn EncryptedReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) ty
             self.block_end = std.mem.bigToNative(MsgSizeT, raw_block_size) + block_header_size;
             std.debug.assert(self.block_end <= self.block_buf.len);
 
-            if (self.block_end < max_msg_size - block_header_size) {
-                std.debug.print("Read {} {} B Block\n", .{ raw_block_size - block_header_size, max_msg_size });
+            if (self.block_end < block_header_size + msg_size_size + max_msg_size) {
+                std.debug.print("Read {} of maximum {} B Block\n", .{ self.block_end, block_header_size + msg_size_size + max_msg_size});
             }
 
             // fill up block buffer
@@ -122,7 +124,7 @@ pub fn EncryptedReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) ty
         }
 
         /// Reads a message from the encrypted underlying reader.
-        pub fn readMessage(self: *Self) !?[]u8 {
+        pub fn readMessage(self: *Self) !?[]const u8 {
             // fill content buffer if it's basically empty
             try self.ensureContent(msg_size_size) orelse return null;
 
@@ -173,12 +175,13 @@ pub fn EncryptedWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) ty
     const block_header_size = chacha.nonce_length + chacha.tag_length + msg_size_size;
 
     return struct {
-        block_buf: [block_header_size + msg_size_size + max_msg_size]u8 = undefined,
-        write_buf: [msg_size_size + max_msg_size]u8 = undefined,
+        block_buf: [block_header_size + max_block_size]u8 = undefined,
+        write_buf: [max_block_size]u8 = undefined,
         start: usize = 0,
         nonce: [chacha.nonce_length]u8,
         writer: WriterT,
 
+        pub const max_block_size = msg_size_size + max_msg_size;
         const Self = @This();
 
         pub fn init(writer: WriterT) Self {
@@ -215,8 +218,8 @@ pub fn EncryptedWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) ty
         /// Flush the buffer,
         /// writing the encrpyted messages upon the underlying writer
         pub fn flush(self: *Self) !void {
-            if (self.start < max_msg_size + msg_size_size) {
-                std.debug.print("flushing {} of {} B\n", .{ self.start, max_msg_size });
+            if (self.start < max_block_size) {
+                std.debug.print("flushing {} of maximum {} B\n", .{ self.start, msg_size_size + max_msg_size });
             }
 
             // increment nonce
@@ -296,6 +299,9 @@ pub fn EncryptedWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) ty
                 std.mem.asBytes(&std.mem.nativeToBig(IntT, int))
             );
         }
+
+        // TODO: Add direct block writing/reading
+        // to prevent memcopy-ing readMessage
     };
 }
 

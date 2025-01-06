@@ -6,7 +6,8 @@ const download = @import("download.zig").download;
 
 
 // Declare SMD-Transfer Protocol Version
-pub const proto_version: u8 = 0;
+pub const proto_version: u8 = 1;
+// TODO: maybe use explicit threds for higher stack size
 pub const max_msg_len = 1 << 20;
 
 

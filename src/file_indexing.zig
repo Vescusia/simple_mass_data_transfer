@@ -113,11 +113,10 @@ pub const FileIndex = struct {
     }
 };
 
-
 /// Assumes that `root_dir` is absolute.
 ///
 /// Relativizes the paths to `raw_root_dir`
-pub fn indexFiles(alloc: std.mem.Allocator, raw_root_dir: []const u8) !FileIndex {
+pub fn indexFiles(alloc: std.mem.Allocator, file_open_flags: fs.File.OpenFlags, raw_root_dir: []const u8) !FileIndex {
     std.debug.assert(raw_root_dir.len > 0);
     std.debug.assert(fs.path.isAbsolute(raw_root_dir));
 
@@ -135,8 +134,8 @@ pub fn indexFiles(alloc: std.mem.Allocator, raw_root_dir: []const u8) !FileIndex
 
     // define OpenOptions
     const dir_open_options: fs.Dir.OpenDirOptions = .{ .iterate = true };
-    const file_open_options: fs.File.OpenFlags = .{ .mode = .read_only, .lock = .none };
 
+    // TODO: no absolute bullshit.
     // add initial directory
     try dir_stack.append(.{
         .dir = try fs.openDirAbsolute(root_dir.bytes(), dir_open_options),
@@ -161,7 +160,7 @@ pub fn indexFiles(alloc: std.mem.Allocator, raw_root_dir: []const u8) !FileIndex
 
             switch (entry.kind) {
                 .file => {
-                    const file = try fs.openFileAbsolute(real_path, file_open_options);
+                    const file = try fs.openFileAbsolute(real_path, file_open_flags);
                     const path = PathBuf.from(real_path);
 
                     try file_index.addFile(path, file);
@@ -246,14 +245,14 @@ pub const PathBuf = struct {
         }
     }
 
-    /// Cuts of `parent` from `self`.
-    /// Assumes that `parent` is a a part of `self`
-    pub fn relativize(self: *Self, parent: []const u8) void {
-        const up_to = @min(self.len, parent.len);
+    /// Cuts of `relative` from `self`.
+    /// Assumes that `relative` is a a part of `self`
+    pub fn relativize(self: *Self, relative: []const u8) void {
+        const up_to = @min(self.len, relative.len);
 
         // calculate up to which character the paths match
         const match_to =
-            for (0.., self.path_buf[0..up_to], parent[0..up_to]) |i, self_char, parent_char| {
+            for (0.., self.path_buf[0..up_to], relative[0..up_to]) |i, self_char, parent_char| {
                 if (self_char != parent_char) {
                     break i;
                 }
@@ -270,22 +269,35 @@ pub const PathBuf = struct {
         const last = self.path_buf[self.len - 1];
         return last == '/' or last == '\\';
     }
+
+    /// Returns the parental dir path of `self`. If `self` has no parent, returns `null`
+    pub fn parent(self: *const Self) ?[]const u8 {
+        for (0..self.len) |i| {
+            const rev_i = self.len - i;
+            const char = self.path_buf[rev_i];
+
+            if (char == '/' or char == '\\') {
+                return self.path_buf[0..rev_i];
+            }
+        }
+        else {
+            return null;
+        }
+    }
 };
 
 test "PathBuf" {
-    const assert = std.debug.assert;
-
     var path = PathBuf.from("/testing/src/uol.id");
-    assert(std.mem.eql(u8, path.bytes(), "/testing/src/uol.id"));
+    try std.testing.expect(std.mem.eql(u8, path.bytes(), "/testing/src/uol.id"));
 
-    assert(std.mem.eql(u8, path.name(), "uol.id"));
+    try std.testing.expect(std.mem.eql(u8, path.name(), "uol.id"));
 
     path.relativize("/testing/src/");
-    assert(std.mem.eql(u8, path.bytes(), "uol.id"));
+    try std.testing.expect(std.mem.eql(u8, path.bytes(), "uol.id"));
 
-    assert(!path.lastIsSlash());
+    try std.testing.expect(!path.lastIsSlash());
     path.addSlash();
-    assert(path.lastIsSlash());
+    try std.testing.expect(path.lastIsSlash());
 
-    assert(std.mem.eql(u8, "uol.id\\hoho", path.join("hoho")) or std.mem.eql(u8, "uol.id/hoho", path.join("hoho")));
+    try std.testing.expect(std.mem.eql(u8, "uol.id\\hoho", path.join("hoho")) or std.mem.eql(u8, "uol.id/hoho", path.join("hoho")));
 }

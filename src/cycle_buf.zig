@@ -10,8 +10,11 @@ const Mutex = std.Thread.Mutex;
 ///
 /// The `arr_len` should be tuned to the Reader/Writer and allow them to fully use their IO Bursts
 pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
-    std.debug.assert(buffer_amt >= 2);
+    std.debug.assert(buffer_amt >= 3);
 
+
+    // TODO: every buffer has it's own mutex
+    // to prevent unnecessary slowdowns and allow for multi read-write stuff
     return struct {
         buffers: [buffer_amt]Buffer,
         writer_i: usize = 0,
@@ -58,32 +61,19 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
 
         pub const CycleWriter = struct {
             super: *Super,
-            written: usize = 0,
-            write: *[arr_len]u8 = undefined,
+            write_active: bool = false,
 
             const Self = @This();
-
-            /// Start a Write (`finishwrite()` to finish it)
-            ///
-            /// Returns a Pointer to the Buffered Array.
-            ///
-            /// Will **not** block.
-            pub fn startWrite(self: *Self) []u8 {
-                const super = self.super;
-
-                super.mutex.lock();
-                defer super.mutex.unlock();
-
-                // return buffer
-                return super.buffers[super.writer_i].arr;
-            }
 
             /// Finish a Write, advancing to the next Buffer
             /// and allowing the Reader to start Reading this one
             ///
             /// Will Block if the Reader is too slow.
-            pub fn finishWrite(self: *Self, written: usize) void {
+            pub fn finishWrite(self: *@This(), written: usize) void {
                 const super = self.super;
+
+                std.debug.assert(self.write_active == true);
+                defer self.write_active = false;
 
                 super.mutex.lock();
                 defer super.mutex.unlock();
@@ -103,6 +93,26 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
                 // signal Reader that a Buffer has been finished
                 super.write_update.signal();
             }
+
+            /// Start a Write (`finishwrite()` to finish it)
+            ///
+            /// Returns a Pointer to the Buffered Array.
+            ///
+            /// Will **not** block.
+            pub fn startWrite(self: *Self) []u8 {
+                const super = self.super;
+
+                std.debug.assert(self.write_active == false);
+                defer self.write_active = true;
+
+                super.mutex.lock();
+                defer super.mutex.unlock();
+
+                // return buffer
+                return super.buffers[super.writer_i].arr;
+            }
+
+
         };
 
         /// Only one Thread may be the Writer.
@@ -115,7 +125,7 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
 
         pub const CycleReader = struct {
             super: *Super,
-            reader_i: usize = 0,
+            read_active: bool = false,
 
             const Self = @This();
 
@@ -126,6 +136,9 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
             /// Will Block if the Writer is too slow.
             pub fn startRead(self: *Self) []u8 {
                 const super = self.super;
+
+                std.debug.assert(self.read_active == false);
+                defer self.read_active = true;
 
                 super.mutex.lock();
                 defer super.mutex.unlock();
@@ -146,6 +159,9 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
             /// Will **not** block.
             pub fn finishRead(self: *Self) void {
                 const super = self.super;
+
+                std.debug.assert(self.read_active == true);
+                defer self.read_active = false;
 
                 super.mutex.lock();
                 defer super.mutex.unlock();

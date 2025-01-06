@@ -3,17 +3,25 @@ const net = std.net;
 
 const cryptio = @import("cryptio.zig");
 const indexing = @import("file_indexing.zig");
+const shared = @import("shared.zig");
+const cyclebuf = @import("cycle_buf.zig");
 
 const main = @import("main.zig");
 const proto_version = main.proto_version;
 const max_msg_len = main.max_msg_len;
 
 
+const CycleBuffers = cyclebuf.CycleBuffers(1024, max_msg_len);
+
 pub fn download(alloc: std.mem.Allocator) !void {
     const stream = try net.tcpConnectToHost(alloc, "127.0.0.1", 5882);
     defer stream.close();
 
     defer std.debug.print("Disconnected from server", .{});
+
+    // get base dir
+    const base_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\test1");
+    defer alloc.free(base_dir);
 
     // create encrypted io
     var writer = cryptio.EncryptedWriter(@TypeOf(stream.writer()), max_msg_len, "raw_key: []const u8")
@@ -30,34 +38,75 @@ pub fn download(alloc: std.mem.Allocator) !void {
         std.debug.print("Using protcol version {}\n", .{ proto_version });
     }
 
-    // create file index
-    const index_len = try reader.readInt(u64) orelse return;
-    std.debug.print("Advertised file index includes {} files.\n", .{index_len});
-    var file_index = try std.ArrayList(indexing.FileIndexEntry).initCapacity(alloc, @as(usize, index_len));
+    // receive file index from server
+    var file_index = try shared.readFileIndex(alloc, &reader) orelse return;
     defer file_index.deinit();
+    std.debug.print("Advertised file index includes {} files ({} kiB)\n", .{ file_index.files().len, file_index.total_size / 1024 });
 
-    // send saved file index
+    // create cycle buffers
+    var cycle_bufs = try CycleBuffers.init(alloc);
+    var cycle_writer = cycle_bufs.cycleWriter();
+    defer cycle_bufs.deinit();
 
-    // receive new or updated files
-    var size_sum: u64 = 0;
-    for (0..index_len) |i| {
-        try file_index.append(.{
-            .id = try reader.readInt(u256) orelse return,
-            .size = try reader.readInt(u64) orelse return,
-            .path = indexing.PathBuf.from(try reader.readMessage() orelse return),
-            .file = undefined,
-            .lock = undefined
-        });
-        size_sum += file_index.items[i].size;
-    }
-
-    // integrate new and updated files
-    std.debug.print("Total size: {} kiB\n", .{ size_sum / 1024 });
+    // start file writer thread
+    const file_write_thread = try std.Thread.spawn(.{}, fileWriter, .{ &file_index,  cycle_bufs.cycleReader(), base_dir});
 
     // receive bytes
     var total_read: usize = 0;
-    while (try reader.readMessage()) |msg| {
+    while (total_read < file_index.total_size) {
+        var write_buf = cycle_writer.startWrite();
+
+        const msg = try reader.readMessage() orelse return;
+        @memcpy(write_buf[0..msg.len], msg);
+
         total_read += msg.len;
+        cycle_writer.finishWrite(msg.len);
     }
-    std.debug.print("Received {}\n", .{total_read / 1024});
+
+    // join with file writer
+    std.debug.print("All files read\n", .{});
+    file_write_thread.join();
+}
+
+
+fn fileWriter(file_index: *indexing.FileIndex, raw_cycle_reader: CycleBuffers.CycleReader, base_dir_path: []const u8) !void {
+    defer std.debug.print("All files written\n", .{});
+
+    var base_dir = try std.fs.openDirAbsolute(base_dir_path, .{});
+
+    // open all files
+    for (file_index.files()) |*file| {
+        if (file.path.parent()) |parent| {
+            try base_dir.makePath(parent);
+        }
+        file.file = try base_dir.createFile(file.path.bytes(), .{ .lock = .exclusive, .truncate = true });
+    }
+
+    var cycle_reader = raw_cycle_reader;
+
+    var read_buf = cycle_reader.startRead();
+    var buf_amt_read: usize = 0;
+
+    // TODO: writev
+    for (file_index.files()) |*file| {
+        file.lock.lock();
+        defer file.lock.unlock();
+        defer file.file.close();
+
+        var file_amt_written: usize = 0;
+        while (file_amt_written < file.size) {
+            if (buf_amt_read == read_buf.len) {
+                //std.debug.print("Finishing Write to File\n", .{});
+                cycle_reader.finishRead();
+                read_buf = cycle_reader.startRead();
+                buf_amt_read = 0;
+            }
+
+            const new_amt_written = @min(file.size - file_amt_written, read_buf.len - buf_amt_read);
+            try file.file.writeAll(read_buf[buf_amt_read..buf_amt_read + new_amt_written]);
+
+            file_amt_written += new_amt_written;
+            buf_amt_read += new_amt_written;
+        }
+    }
 }
