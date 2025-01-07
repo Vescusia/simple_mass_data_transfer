@@ -1,17 +1,15 @@
 const std = @import("std");
 const net = std.net;
 
-const cryptio = @import("cryptio.zig");
 const indexing = @import("file_indexing.zig");
 const cycbuf = @import("cycle_buf.zig");
 const shared = @import("shared.zig");
 
 const main = @import("main.zig");
 const proto_version = main.proto_version;
-const max_msg_len = main.max_msg_len;
+const CryptIO = main.CryptIO;
 
-
-const CycleBuf = cycbuf.CycleBuffers(512, max_msg_len);
+const CycleBuf = cycbuf.CycleBuffers(512, CryptIO.max_block_size);
 
 var working_dir: []const u8 = undefined;
 var stdout: @TypeOf(std.io.getStdOut().writer()) = undefined;
@@ -57,9 +55,9 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
     defer std.debug.print("Client<{}> disconnected.\n", .{client.address});
 
     // create encrypted io
-    var writer = try cryptio.EncryptedWriter(@TypeOf(client.stream.writer()), max_msg_len, "raw_key: []const u8")
+    var writer = try CryptIO.EncryptedWriter(@TypeOf(client.stream.writer()), "raw_key: []const u8")
         .init(client.stream.writer());
-    var reader = try cryptio.EncryptedReader(@TypeOf(client.stream.reader()), max_msg_len, "raw_key: []const u8")
+    var reader = try CryptIO.EncryptedReader(@TypeOf(client.stream.reader()), "raw_key: []const u8")
         .init(client.stream.reader()) orelse return;
 
     // starting timer
@@ -96,13 +94,12 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
         //std.debug.print("Writing\n", .{});
         defer cycle_reader.finishRead();
 
-        try writer.writeMessage(read);
+        try writer.writeBufToBlock(read);
 
-        if (read.len < max_msg_len) {
+        if (read.len < CryptIO.max_block_size) {
             break;
         }
     }
-    try writer.flush();
 
     // join with file reader
     try stdout.print("All files sent\n", .{});

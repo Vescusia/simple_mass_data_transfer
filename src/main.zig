@@ -3,12 +3,16 @@ const builtin = @import("builtin");
 
 const server = @import("server.zig").server;
 const download = @import("download.zig").download;
+const cryptio = @import("cryptio.zig");
 
 
 // Declare SMD-Transfer Protocol Version
-pub const proto_version: u8 = 1;
-// 1 << 20 seems to be ideal for my system.
-pub const max_msg_len = 1 << 20;
+pub const proto_version: u8 = 2;
+
+// Create EncryptedIO
+// 1 << 20 seems to work well on my system
+pub const CryptIO = cryptio.EncryptedIO(1 << 20);
+
 
 
 pub fn main() !void {
@@ -31,11 +35,11 @@ pub fn main() !void {
     const thread = blk: {
         if (std.mem.eql(u8, cmd, "host")) {
             std.debug.print("HOSTING\n\n", .{});
-            break :blk try std.Thread.spawn(.{ .stack_size = max_msg_len * 32 }, server, .{ alloc });
+            break :blk try std.Thread.spawn(.{ .stack_size = CryptIO.max_block_size * 32 }, server, .{ alloc });
         }
         else if (std.mem.eql(u8, cmd, "dl")) {
             std.debug.print("DOWNLOADING\n\n", .{});
-            break :blk try std.Thread.spawn(.{ .stack_size = max_msg_len * 32 }, download, .{ alloc });
+            break :blk try std.Thread.spawn(.{ .stack_size = CryptIO.max_block_size * 32 }, download, .{ alloc });
         }
         else {
             std.debug.print("Please use either 'host' or 'dl'!\n", .{});

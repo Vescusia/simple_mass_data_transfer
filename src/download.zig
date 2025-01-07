@@ -1,20 +1,19 @@
 const std = @import("std");
 const net = std.net;
 
-const cryptio = @import("cryptio.zig");
 const indexing = @import("file_indexing.zig");
 const shared = @import("shared.zig");
 const cyclebuf = @import("cycle_buf.zig");
 
 const main = @import("main.zig");
 const proto_version = main.proto_version;
-const max_msg_len = main.max_msg_len;
+const CryptIO = main.CryptIO;
 
 
 const write: bool = true;
 
 
-const CycleBuffers = cyclebuf.CycleBuffers(512, max_msg_len);
+const CycleBuffers = cyclebuf.CycleBuffers(512, CryptIO.max_block_size);
 
 pub fn download(alloc: std.mem.Allocator) !void {
     const stream = try net.tcpConnectToHost(alloc, "127.0.0.1", 5882);
@@ -26,14 +25,15 @@ pub fn download(alloc: std.mem.Allocator) !void {
     defer std.debug.print("Disconnected from server", .{});
 
     // get base dir
-    const base_dir = try std.fs.realpathAlloc(alloc, "E:\\test");
+    //const base_dir = try std.fs.realpathAlloc(alloc, "E:\\test");
+    const base_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\test1");
     defer alloc.free(base_dir);
 
     // create encrypted io
-    var writer = try cryptio.EncryptedWriter(@TypeOf(stream.writer()), max_msg_len, "raw_key: []const u8")
+    var writer = try CryptIO.EncryptedWriter(@TypeOf(stream.writer()), "raw_key: []const u8")
         .init(stream.writer());
-    var reader = try cryptio.EncryptedReader(@TypeOf(stream.reader()), max_msg_len, "raw_key: []const u8")
-       .init(stream.reader()) orelse return;
+    var reader = try CryptIO.EncryptedReader(@TypeOf(stream.reader()), "raw_key: []const u8")
+        .init(stream.reader()) orelse return;
 
     // exchange version
     try writer.putInt(proto_version); try writer.flush();
@@ -60,13 +60,10 @@ pub fn download(alloc: std.mem.Allocator) !void {
     // receive bytes
     var total_read: usize = 0;
     while (total_read < file_index.total_size) {
-        var write_buf = cycle_writer.startWrite();
+        const amt_read = try reader.readBlockToBuf(cycle_writer.startWrite()) orelse return;
 
-        const msg = try reader.readMessage() orelse return;
-        @memcpy(write_buf[0..msg.len], msg);
-
-        total_read += msg.len;
-        cycle_writer.finishWrite(msg.len);
+        total_read += amt_read;
+        cycle_writer.finishWrite(amt_read);
     }
 
     // join with file writer
