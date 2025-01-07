@@ -11,14 +11,15 @@ const proto_version = main.proto_version;
 const max_msg_len = main.max_msg_len;
 
 
+const CycleBuf = cycbuf.CycleBuffers(512, max_msg_len);
+
 var working_dir: []const u8 = undefined;
-const CycleBuf = cycbuf.CycleBuffers(128, max_msg_len);
+var stdout: @TypeOf(std.io.getStdOut().writer()) = undefined;
 
 
 pub fn server(alloc: std.mem.Allocator) !void {
     // instantiate io
-    var stdout = std.io.getStdOut().writer();
-    var stdin = std.io.getStdIn().reader();
+    stdout = std.io.getStdOut().writer();
 
     // instantiate address
     const address = try net.Address.parseIp("127.0.0.1", 5882);
@@ -27,13 +28,13 @@ pub fn server(alloc: std.mem.Allocator) !void {
     var listener = try address.listen(.{ .reuse_address = true, .reuse_port = true });
 
     // create absolute path
-    working_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\test");
+    working_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\simple_mass_data_transfer");
     defer alloc.free(working_dir);
 
     // index files
-    var file_index = try indexing.indexFiles(alloc, .{.mode = .read_only, .lock = .shared}, working_dir);
+    var file_index = try indexing.indexFiles(alloc, .{ .mode = .read_only, .lock = .shared }, working_dir);
     defer file_index.closeAll();
-    std.debug.print("Working in {s}, containing {} files ({} kiB)\n", .{ working_dir, file_index.files().len, file_index.total_size / 1024 });
+    try stdout.print("Working in {s}, containing {} files ({} kiB)\n", .{ working_dir, file_index.files().len, file_index.total_size / 1024 });
 
     // main loop
     try stdout.print("Server is listening on {} with protocol version {}\n", .{ address, proto_version });
@@ -45,15 +46,7 @@ pub fn server(alloc: std.mem.Allocator) !void {
         // handle client
         try handle_client(alloc, client, file_index);
 
-        // ask user if they want to continue
-        try stdout.print("Continue? y/N > ", .{});
-        var buf: [128]u8 = undefined;
-        _ = try stdin.readAtLeast(&buf, 1);
-
-        if (buf[0] != 'Y' and buf[0] != 'y') {
-            try stdout.print("Shutting down.\n", .{});
-            break;
-        }
+        break;
     }
 }
 
@@ -64,10 +57,10 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
     defer std.debug.print("Client<{}> disconnected.\n", .{client.address});
 
     // create encrypted io
-    var writer = cryptio.EncryptedWriter(@TypeOf(client.stream.writer()), max_msg_len, "raw_key: []const u8")
+    var writer = try cryptio.EncryptedWriter(@TypeOf(client.stream.writer()), max_msg_len, "raw_key: []const u8")
         .init(client.stream.writer());
-    var reader = cryptio.EncryptedReader(@TypeOf(client.stream.reader()), max_msg_len, "raw_key: []const u8")
-        .init(client.stream.reader());
+    var reader = try cryptio.EncryptedReader(@TypeOf(client.stream.reader()), max_msg_len, "raw_key: []const u8")
+        .init(client.stream.reader()) orelse return;
 
     // starting timer
     const start = try std.time.Instant.now();
@@ -76,10 +69,10 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
     try writer.putInt(proto_version); try writer.flush();
     const client_version = try reader.readInt(@TypeOf(proto_version)) orelse return;
     if (client_version != proto_version) {
-        std.debug.print("{}: using invalid protocol version {}\n", .{ client.address, client_version });
+        try stdout.print("{}: using invalid protocol version {}\n", .{ client.address, client_version });
     }
     else {
-        std.debug.print("Correct protocol version\n", .{});
+        try stdout.print("Correct protocol version\n", .{});
     }
 
     // receive client progress file index
@@ -109,14 +102,15 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
             break;
         }
     }
+    try writer.flush();
 
     // join with file reader
-    std.debug.print("All files sent\n", .{});
+    try stdout.print("All files sent\n", .{});
     file_read_thread.join();
 
     // print stats
     const elapsed_s: f64 = @as(f64, @floatFromInt((try std.time.Instant.now()).since(start))) / @as(f64, @floatFromInt(std.time.ns_per_s));
-    std.debug.print("{} kiB in {e} s ({d} min) ({d} kiB/s)\n", .{ file_index.total_size / 1024, elapsed_s, elapsed_s / 60, @round(@as(f64, @floatFromInt(file_index.total_size / 1024)) / elapsed_s)});
+    try stdout.print("{} kiB in {e} s ({d} min) ({d} kiB/s)\n", .{ file_index.total_size / 1024, elapsed_s, elapsed_s / 60, @round(@as(f64, @floatFromInt(file_index.total_size / 1024)) / elapsed_s)});
 }
 
 

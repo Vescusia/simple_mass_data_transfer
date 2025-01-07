@@ -1,4 +1,5 @@
 const std = @import("std");
+const native_endian = @import("builtin").cpu.arch.endian();
 
 const chacha = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
@@ -10,7 +11,7 @@ pub fn EncryptedReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) ty
     const MsgSizeT = SmallestInt(max_msg_size);
     const msg_size_size = @sizeOf(MsgSizeT);
 
-    const block_header_size = chacha.nonce_length + chacha.tag_length + msg_size_size;
+    const block_header_size = msg_size_size + chacha.tag_length;
 
     const padded_key = padKey(raw_key);
 
@@ -22,13 +23,25 @@ pub fn EncryptedReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) ty
         content_end: usize = 0,
         content_start: usize = 0,
         reader: ReaderT,
+        nonce: [chacha.nonce_length]u8,
 
         pub const max_block_size = msg_size_size + max_msg_size;
         const Self = @This();
 
-        pub fn init(reader: ReaderT) Self {
+        /// Will instantly read the initial nonce from the reader.
+        /// Make sure that every reader `.init` matches exactly one writer `.init`.
+        ///
+        /// Returns `null`, when the reader reaches EOF before the initial nonce could be read.
+        pub fn init(reader: ReaderT) !?Self {
+            // read initial nonce
+            var nonce: [chacha.nonce_length]u8 = undefined;
+            if (try reader.readAll(&nonce) < nonce.len) {
+                return null;
+            }
+
             return Self {
                 .reader = reader,
+                .nonce = nonce
             };
         }
 
@@ -96,18 +109,22 @@ pub fn EncryptedReader(ReaderT: type, max_msg_size: u64, raw_key: []const u8) ty
 
         /// Decrypts block buffer into second half of content buffer
         fn decryptBlock(self: *Self) !void {
-            const nonce = self.block_buf[msg_size_size..msg_size_size + chacha.nonce_length];
-            const tag = self.block_buf[msg_size_size + chacha.nonce_length..block_header_size];
+            // increment nonce
+            defer incrementNonce(&self.nonce);
+
+            // read tag and cypher text
+            const tag = self.block_buf[msg_size_size..block_header_size];
             const crypted = self.block_buf[block_header_size..self.block_end];
 
             self.content_end = max_msg_size + self.block_end - block_header_size;
 
+            // decrypt
             try chacha.decrypt(
                 self.content_buf[max_msg_size..self.content_end],
                 crypted,
                 tag.*,
                 &ad,
-                nonce.*,
+                self.nonce,
                 padded_key
             );
         }
@@ -167,12 +184,7 @@ pub fn EncryptedWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) ty
 
     const padded_key = padKey(raw_key);
 
-    // integer type with nonce length size
-    const NonceIntT = @Type(.{
-        .Int = .{ .signedness = .unsigned, .bits = chacha.nonce_length * 8 }
-    });
-
-    const block_header_size = chacha.nonce_length + chacha.tag_length + msg_size_size;
+    const block_header_size = msg_size_size + chacha.tag_length;
 
     return struct {
         block_buf: [block_header_size + max_block_size]u8 = undefined,
@@ -184,9 +196,15 @@ pub fn EncryptedWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) ty
         pub const max_block_size = msg_size_size + max_msg_size;
         const Self = @This();
 
-        pub fn init(writer: WriterT) Self {
+        /// Will instantly write the initial nonce to the writer.
+        /// Make sure that every writer `.init` matches exactly one reader `.init`.
+        pub fn init(writer: WriterT) !Self {
+            // generate initial nonce
             var nonce: [chacha.nonce_length]u8 = undefined;
             std.crypto.random.bytes(&nonce);
+
+            // send initial nonce
+            try writer.writeAll(&nonce);
 
             return .{
                 .nonce = nonce,
@@ -223,15 +241,7 @@ pub fn EncryptedWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) ty
             }
 
             // increment nonce
-            std.mem.writePackedInt(
-                NonceIntT, &self.nonce, 0, std.mem.bytesToValue(NonceIntT, &self.nonce) +% 1, .big
-            );
-
-            // copy in nonce
-            @memcpy(
-                self.block_buf[msg_size_size..msg_size_size + chacha.nonce_length],
-                &self.nonce
-            );
+            defer incrementNonce(&self.nonce);
 
             // copy in block size
             @memcpy(
@@ -255,7 +265,7 @@ pub fn EncryptedWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) ty
 
             // copy in tag
             @memcpy(
-                self.block_buf[msg_size_size + chacha.nonce_length..block_header_size],
+                self.block_buf[msg_size_size..block_header_size],
                 &tag
             );
 
@@ -306,9 +316,21 @@ pub fn EncryptedWriter(WriterT: type, max_msg_size: u64, raw_key: []const u8) ty
 }
 
 
+/// Increment the provided nonce as if it were an integer
+fn incrementNonce(nonce: *[chacha.nonce_length]u8) void {
+    const NonceIntT = @Type(.{
+        .Int = .{ .signedness = .unsigned, .bits = chacha.nonce_length * 8 }
+    });
+
+    std.mem.writePackedInt(
+        NonceIntT, nonce, 0, std.mem.bytesToValue(NonceIntT, nonce) +% 1, native_endian
+    );
+}
+
+
 /// Calculate the smallest Integer Type that can represent the `max_size` and is a multiple of 8 (bits)
 fn SmallestInt(comptime max_size: usize) type {
-    const bits = @as(u16, @floor(@log2(@as(f64, max_size))));
+    const bits = @as(u16, @floor(@log2(@as(f64, max_size)))) + 1;
     return @Type(.{ .Int = .{ .signedness = .unsigned, .bits = bits + 8 - bits % 8 } });  // needs to be a multiple of 8
 }
 
