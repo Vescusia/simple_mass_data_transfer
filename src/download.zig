@@ -19,21 +19,25 @@ pub fn download(alloc: std.mem.Allocator) !void {
     const stream = try net.tcpConnectToHost(alloc, "127.0.0.1", 5882);
     defer stream.close();
 
+
     // get stdout
     var stdout = std.io.getStdOut().writer();
-
+    // defer finishing write
     defer std.debug.print("Disconnected from server", .{});
+
 
     // get base dir
     //const base_dir = try std.fs.realpathAlloc(alloc, "E:\\test");
     const base_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\test1");
     defer alloc.free(base_dir);
 
+
     // create encrypted io
     var writer = try CryptIO.EncryptedWriter(@TypeOf(stream.writer()), "raw_key: []const u8")
         .init(stream.writer());
     var reader = try CryptIO.EncryptedReader(@TypeOf(stream.reader()), "raw_key: []const u8")
         .init(stream.reader()) orelse return;
+
 
     // exchange version
     try writer.putInt(proto_version); try writer.flush();
@@ -44,10 +48,21 @@ pub fn download(alloc: std.mem.Allocator) !void {
         try stdout.print("Using protcol version {}\n", .{ proto_version });
     }
 
-    // receive file index from server
+
+    // create file index
+    const current_file_index = try indexing.indexFiles(alloc, .{}, base_dir);
+    defer current_file_index.deinit();
+
+    // send file index
+    try shared.writeFileIndex(&writer, current_file_index);
+    try writer.flush();
+
+
+    // receive updated file index from server
     var file_index = try shared.readFileIndex(alloc, &reader) orelse return;
-    defer file_index.deinit();
+     defer file_index.deinit();
     try stdout.print("Advertised file index includes {} files ({} kiB)\n", .{ file_index.files().len, file_index.total_size / 1024 });
+
 
     // create cycle buffers
     var cycle_bufs = try CycleBuffers.init(alloc);
@@ -57,6 +72,7 @@ pub fn download(alloc: std.mem.Allocator) !void {
     // start file writer thread
     const file_write_thread = try std.Thread.spawn(.{}, fileWriter, .{ &file_index,  cycle_bufs.cycleReader(), base_dir});
 
+
     // receive bytes
     var total_read: usize = 0;
     while (total_read < file_index.total_size) {
@@ -65,6 +81,7 @@ pub fn download(alloc: std.mem.Allocator) !void {
         total_read += amt_read;
         cycle_writer.finishWrite(amt_read);
     }
+
 
     // join with file writer
     try stdout.print("All files read\n", .{});
@@ -113,5 +130,7 @@ fn fileWriter(file_index: *indexing.FileIndex, raw_cycle_reader: CycleBuffers.Cy
             file_amt_written += new_amt_written;
             buf_amt_read += new_amt_written;
         }
+
+        try file.file.updateTimes(1, file.modified);
     }
 }

@@ -16,8 +16,9 @@ var stdout: @TypeOf(std.io.getStdOut().writer()) = undefined;
 
 
 pub fn server(alloc: std.mem.Allocator) !void {
-    // instantiate io
+    // create stdout
     stdout = std.io.getStdOut().writer();
+
 
     // instantiate address
     const address = try net.Address.parseIp("127.0.0.1", 5882);
@@ -25,9 +26,11 @@ pub fn server(alloc: std.mem.Allocator) !void {
     // create listener
     var listener = try address.listen(.{ .reuse_address = true, .reuse_port = true });
 
+
     // create absolute path
     working_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\simple_mass_data_transfer");
     defer alloc.free(working_dir);
+
 
     // index files
     var file_index = try indexing.indexFiles(alloc, .{ .mode = .read_only, .lock = .shared }, working_dir);
@@ -60,8 +63,10 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
     var reader = try CryptIO.EncryptedReader(@TypeOf(client.stream.reader()), "raw_key: []const u8")
         .init(client.stream.reader()) orelse return;
 
-    // starting timer
-    const start = try std.time.Instant.now();
+
+    // start timer
+    const complete_start = try std.time.Instant.now();
+
 
     // exchange version
     try writer.putInt(proto_version); try writer.flush();
@@ -73,20 +78,31 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
         try stdout.print("Correct protocol version\n", .{});
     }
 
-    // receive client progress file index
 
-    // combine
+    // receive client progress file index
+    const client_index = try shared.readFileIndex(alloc, &reader) orelse return;
+    defer client_index.deinit();
+
+    // TODO: combine
+
 
     // send combined file index
     try shared.writeFileIndex(&writer, file_index);
     try writer.flush();
 
 
-    // start file reader thread
+    // start pure write timer
+    const pure_start = try std.time.Instant.now();
+
+
+    // create cycle buffers
     var bufs = try CycleBuf.init(alloc);
     defer bufs.deinit();
+
+    // start file reader thread
     const file_read_thread = try std.Thread.spawn(.{}, fileReader, .{ file_index, bufs.cycleWriter() });
-    
+
+
     // send bytes
     var cycle_reader = bufs.cycleReader();
     while (true) {
@@ -101,13 +117,21 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
         }
     }
 
+
     // join with file reader
     try stdout.print("All files sent\n", .{});
     file_read_thread.join();
 
+
     // print stats
-    const elapsed_s: f64 = @as(f64, @floatFromInt((try std.time.Instant.now()).since(start))) / @as(f64, @floatFromInt(std.time.ns_per_s));
-    try stdout.print("{} kiB in {e} s ({d} min) ({d} kiB/s)\n", .{ file_index.total_size / 1024, elapsed_s, elapsed_s / 60, @round(@as(f64, @floatFromInt(file_index.total_size / 1024)) / elapsed_s)});
+    const elapsed_s: f64 = @as(f64, @floatFromInt((try std.time.Instant.now()).since(complete_start))) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    const pure_elapsed_s: f64 = @as(f64, @floatFromInt((try std.time.Instant.now()).since(pure_start))) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    try stdout.print("{} kiB in {e} s ({d} min) ({d} kiB/s (pure: {d} kiB/s))\n", .{
+        file_index.total_size / 1024,
+        elapsed_s, elapsed_s / 60,
+        @round(@as(f64, @floatFromInt(file_index.total_size / 1024)) / elapsed_s),
+        @round(@as(f64, @floatFromInt(file_index.total_size / 1024)) / pure_elapsed_s)
+    });
 }
 
 

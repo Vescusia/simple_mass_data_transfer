@@ -13,8 +13,9 @@ pub const FileIndex = struct {
     pub const FileIndexEntry = struct {
         path: PathBuf,
         file: fs.File,
-        id: u256,
+        id: u128,
         size: u64,
+        modified: i128,
         lock: std.Thread.Mutex = std.Thread.Mutex{},
 
         pub fn format(self: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
@@ -24,22 +25,18 @@ pub const FileIndex = struct {
             try std.fmt.format(writer, "'{s}': {} B - {x}\n", .{ self.path.bytes(), self.size, self.id });
         }
 
-        fn fileMetaToId(name: []const u8, meta: fs.File.Metadata) u256 {
-            var id: u256 = @intCast(meta.created() orelse 0);
-            id |= @as(u128, @bitCast(meta.modified())) << (255 - @typeInfo(@TypeOf(meta.modified())).Int.bits);
+        fn fileMetaToId(name: []const u8, modified: i128) u128 {
+            // create id array
+            var id_arr: [@sizeOf(u128)]u8 = undefined;
 
-            // rotate by name len
-            const shft_amt: u8 = @intCast(@as(u256, name.len *% name.len) % 255);
-            id = (id << shft_amt) | (id >> 255 - shft_amt);
+            // hash name into id
+            std.crypto.hash.Md5.hash(name, &id_arr, .{});
 
-            // pad/trim name into 16 byte array
-            var name_bytes: [256/8]u8 = undefined;
-            for (0..(name_bytes.len / name.len)) |copies| {
-                @memcpy(name_bytes[copies * name.len..(copies + 1) * name.len], name[0..]);
-            }
-            @memcpy(name_bytes[name_bytes.len - @min(name.len, name_bytes.len)..], name[0..@min(name.len, name_bytes.len)]);
+            // convert id into u128
+            var id = std.mem.bytesToValue(u128, &id_arr);
 
-            id |= std.mem.bytesToValue(u256, &name_bytes);
+            // xor in modified timestamp
+            id ^= std.mem.bytesToValue(u128, std.mem.asBytes(&modified));
 
             return id;
         }
@@ -48,12 +45,14 @@ pub const FileIndex = struct {
         /// * `file`: open file descriptor
         pub fn fromFile(path: PathBuf, file: fs.File) !@This() {
             const meta = try file.metadata();
+            const modified = meta.modified();
 
             return .{
                 .path = path,
                 .file = file,
                 .size = meta.size(),
-                .id = fileMetaToId(path.name(), meta)
+                .modified = modified,
+                .id = fileMetaToId(path.name(), modified)
             };
         }
     };
@@ -135,11 +134,10 @@ pub fn indexFiles(alloc: std.mem.Allocator, file_open_flags: fs.File.OpenFlags, 
     // define OpenOptions
     const dir_open_options: fs.Dir.OpenDirOptions = .{ .iterate = true };
 
-    // TODO: no absolute bullshit.
     // add initial directory
     try dir_stack.append(.{
         .dir = try fs.openDirAbsolute(root_dir.bytes(), dir_open_options),
-        .path = root_dir
+        .path = PathBuf.from(""),
     });
 
     // crawl directories
@@ -148,36 +146,34 @@ pub fn indexFiles(alloc: std.mem.Allocator, file_open_flags: fs.File.OpenFlags, 
         var curr_dir = dir_stack.pop();
         defer curr_dir.dir.close();
 
-        // turn into actual directory path
-        if (!curr_dir.path.lastIsSlash()) {
-            curr_dir.path.addSlash();
-        }
-
         // iterate over files
         var dir_iter = curr_dir.dir.iterate();
         while (try dir_iter.next()) |entry| {
-            const real_path = curr_dir.path.join(entry.name);
+            var rel_path = curr_dir.path;
+            rel_path.join(entry.name);
 
             switch (entry.kind) {
+                // add file to index
                 .file => {
-                    const file = try fs.openFileAbsolute(real_path, file_open_flags);
-                    const path = PathBuf.from(real_path);
+                    const file = try curr_dir.dir.openFile(entry.name, file_open_flags);
 
-                    try file_index.addFile(path, file);
+                    try file_index.addFile(
+                        rel_path,
+                        file,
+                    );
                 },
                 // add directory to stack
                 .directory => {
-                try dir_stack.append(.{
-                    .dir = try fs.openDirAbsolute(real_path, dir_open_options),
-                    .path = PathBuf.from(real_path)
+                    rel_path.addSlash();
+                    try dir_stack.append(.{
+                        .path = rel_path,
+                        .dir = try curr_dir.dir.openDir(entry.name, dir_open_options),
                 });
             },
                 else => { }
             }
         }
     }
-
-    file_index.relativizeAll(root_dir.bytes());
 
     return file_index;
 }
@@ -201,13 +197,11 @@ pub const PathBuf = struct {
         };
     }
 
+    /// Adds a '/' to the end of the path
     pub fn addSlash(self: *Self) void {
         std.debug.assert(max_path_len > self.len);
 
-        self.path_buf[self.len] = switch (builtin.os.tag) {
-            .windows => '\\',
-            else => '/'
-        };
+        self.path_buf[self.len] = '/';
 
         self.len += 1;
     }
@@ -216,13 +210,13 @@ pub const PathBuf = struct {
         return self.path_buf[0..self.len];
     }
 
-    /// Will join `other` to `self` **without actually affecting `self`**
-    pub fn join(self: *Self, other: []const u8) []const u8 {
+    /// Will join `other` to `self`
+    pub fn join(self: *Self, other: []const u8) void {
         const total_len = self.len + other.len;
         std.debug.assert(max_path_len >= total_len);
 
         @memcpy(self.path_buf[self.len..total_len], other);
-        return self.path_buf[0..total_len];
+        self.len = total_len;
     }
 
     /// Gets the last "part" of the Path.
@@ -284,6 +278,20 @@ pub const PathBuf = struct {
             return null;
         }
     }
+
+    /// Turns any '\' to '/' and "C:\" to '/'
+    pub fn canonicalize(self: *Self) void {
+        if (self.len >= 3 and std.mem.startsWith(u8, self.path_buf[1..], ":\\")) {
+            std.mem.copyForwards(u8, self.path_buf[0..self.len - 2], self.path_buf[2..self.len]);
+        }
+
+        // turn around slashes
+        for (self.path_buf[0..self.len]) |*char| {
+            if (char == '\\') {
+                char = '/';
+            }
+        }
+    }
 };
 
 test "PathBuf" {
@@ -299,5 +307,6 @@ test "PathBuf" {
     path.addSlash();
     try std.testing.expect(path.lastIsSlash());
 
-    try std.testing.expect(std.mem.eql(u8, "uol.id\\hoho", path.join("hoho")) or std.mem.eql(u8, "uol.id/hoho", path.join("hoho")));
+    path.join("hoho");
+    try std.testing.expect(std.mem.eql(u8, "uol.id\\hoho", path.bytes()) or std.mem.eql(u8, "uol.id/hoho", path.bytes()));
 }
