@@ -12,22 +12,17 @@ const Mutex = std.Thread.Mutex;
 pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
     std.debug.assert(buffer_amt >= 3);
 
-
-    // TODO: every buffer has it's own mutex
-    // to prevent unnecessary slowdowns and allow for multi read-write stuff
     return struct {
         buffers: [buffer_amt]Buffer,
-        writer_i: usize = 0,
-        reader_i: usize = 0,
-        mutex: Mutex = Mutex{},
-        write_update: Condition = Condition{},
-        read_update: Condition = Condition{},
         alloc: std.heap.ArenaAllocator,
-
+        write_update: Condition = .{},
 
         const Buffer = struct {
             arr: []u8,
-            written: usize,
+            written: usize = 0,
+            mutex: Mutex = .{},
+            /// Just for the initial reader state
+            valid: bool = false,
         };
 
 
@@ -45,7 +40,9 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
             // create buffers
             var buffers: [buffer_amt]Buffer = undefined;
             for (&buffers) |*buf| {
-                buf.arr = try arena_alloc.allocator().alloc(u8, arr_len);
+                buf.* = .{
+                    .arr = try arena_alloc.allocator().alloc(u8, arr_len),
+                };
             }
 
             return Super{
@@ -61,58 +58,51 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
 
         pub const CycleWriter = struct {
             super: *Super,
-            write_active: bool = false,
+            pos: usize = 0,
 
             const Self = @This();
 
-            /// Finish a Write, advancing to the next Buffer
-            /// and allowing the Reader to start Reading this one
-            ///
-            /// Will Block if the Reader is too slow.
-            pub fn finishWrite(self: *@This(), written: usize) void {
-                const super = self.super;
 
-                std.debug.assert(self.write_active == true);
-                defer self.write_active = false;
+            pub const WriteTxn = struct {
+                pos: usize,
+                super: *Super,
 
-                super.mutex.lock();
-                defer super.mutex.unlock();
-
-                // set current Buffers written bytes
-                super.buffers[super.writer_i].written = written;
-
-                // wait for Reader to finish reading from next Buffer
-                const next_i = (super.writer_i + 1) % buffer_amt;
-                while (next_i == super.reader_i) {
-                    super.read_update.wait(&super.mutex);
+                pub fn buf(self: @This()) []u8 {
+                    return self.super.buffers[self.pos].arr;
                 }
 
-                // move to next Buffer
-                super.writer_i = next_i;
+                /// Finishes the write transaction, allowing
+                /// the reader to start reading the buffer
+                pub fn finish(self: @This(), written: usize) void {
+                    const current_buf = &self.super.buffers[self.pos];
 
-                // signal Reader that a Buffer has been finished
-                super.write_update.signal();
-            }
+                    defer self.super.write_update.signal();
+                    defer current_buf.mutex.unlock();
+
+                    current_buf.valid = true;
+                    current_buf.written = written;
+                }
+            };
+
 
             /// Start a Write (`finishwrite()` to finish it)
             ///
             /// Returns a Pointer to the Buffered Array.
             ///
-            /// Will **not** block.
-            pub fn startWrite(self: *Self) []u8 {
+            /// Will block if the reader is too slow.
+            pub fn startWrite(self: *Self) WriteTxn {
                 const super = self.super;
 
-                std.debug.assert(self.write_active == false);
-                defer self.write_active = true;
+                const buf = &super.buffers[self.pos];
+                buf.mutex.lock();
 
-                super.mutex.lock();
-                defer super.mutex.unlock();
+                defer self.pos = (self.pos + 1) % buffer_amt;
 
-                // return buffer
-                return super.buffers[super.writer_i].arr;
+                return .{
+                    .pos = self.pos,
+                    .super = self.super,
+                };
             }
-
-
         };
 
         /// Only one Thread may be the Writer.
@@ -126,53 +116,60 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
         pub const CycleReader = struct {
             super: *Super,
             read_active: bool = false,
+            pos: usize = 0,
 
-            const Self = @This();
+
+            const ReadTxn = struct {
+                pos: usize,
+                super: *CycleReader,
+
+                pub fn buf(self: @This()) []const u8 {
+                    return self.super.super.buffers[self.pos].arr[0..self.len()];
+                }
+
+                /// The length of the buffer
+                ///
+                /// equivalent to `.buf().len`
+                pub fn len(self: @This()) usize {
+                    return self.super.super.buffers[self.pos].written;
+                }
+
+                /// Finish reading the buffer,
+                /// allowing writers to overwrite it
+                pub fn finish(self: @This()) void {
+                    const super = self.super.super;
+
+                    defer self.super.read_active = false;
+
+                    super.buffers[self.pos].mutex.unlock();
+                }
+            };
+
 
             /// Start a Read (`finishRead()` to finish it)
             ///
             /// Returns a Pointer to the Buffered Array
             ///
             /// Will Block if the Writer is too slow.
-            pub fn startRead(self: *Self) []u8 {
+            pub fn startRead(self: *@This()) ReadTxn {
                 const super = self.super;
 
                 std.debug.assert(self.read_active == false);
                 defer self.read_active = true;
 
-                super.mutex.lock();
-                defer super.mutex.unlock();
+                const buf = &super.buffers[self.pos];
 
-                // wait for Writer to finish writing to current Buffer
-                while (super.reader_i == super.writer_i) {
-                    super.write_update.wait(&super.mutex);
+                buf.mutex.lock();
+                while (!buf.valid) {
+                    super.write_update.wait(&buf.mutex);
                 }
 
-                // return the Bytes
-                const written = super.buffers[super.reader_i].written;
-                return super.buffers[super.reader_i].arr[0..written];
-            }
+                defer self.pos = (self.pos + 1) % buffer_amt;
 
-            /// Finish a Read, advancing to the next Buffer
-            /// and allowing the Writer to overwrite this one
-            ///
-            /// Will **not** block.
-            pub fn finishRead(self: *Self) void {
-                const super = self.super;
-
-                std.debug.assert(self.read_active == true);
-                defer self.read_active = false;
-
-                super.mutex.lock();
-                defer super.mutex.unlock();
-
-                // maybe dynamically resize the buffers?
-
-                // move to next Buffer
-                super.reader_i = (super.reader_i + 1) % buffer_amt;
-
-                // signal Writer that a Buffer has been finished
-                super.read_update.signal();
+                return .{
+                    .pos = self.pos,
+                    .super = self,
+                };
             }
         };
 

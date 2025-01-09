@@ -76,10 +76,11 @@ pub fn download(alloc: std.mem.Allocator) !void {
     // receive bytes
     var total_read: usize = 0;
     while (total_read < file_index.total_size) {
-        const amt_read = try reader.readBlockToBuf(cycle_writer.startWrite()) orelse return;
+        const write_txn = cycle_writer.startWrite();
+        const amt_read = try reader.readBlockToBuf(write_txn.buf()) orelse return;
 
         total_read += amt_read;
-        cycle_writer.finishWrite(amt_read);
+        write_txn.finish(amt_read);
     }
 
 
@@ -104,7 +105,7 @@ fn fileWriter(file_index: *indexing.FileIndex, raw_cycle_reader: CycleBuffers.Cy
 
     var cycle_reader = raw_cycle_reader;
 
-    var read_buf = cycle_reader.startRead();
+    var read_txn = cycle_reader.startRead();
     var buf_amt_read: usize = 0;
 
     // TODO: writev
@@ -115,16 +116,16 @@ fn fileWriter(file_index: *indexing.FileIndex, raw_cycle_reader: CycleBuffers.Cy
 
         var file_amt_written: usize = 0;
         while (file_amt_written < file.size) {
-            if (buf_amt_read == read_buf.len) {
+            if (buf_amt_read == read_txn.len()) {
                 //std.debug.print("Finishing Write to File\n", .{});
-                cycle_reader.finishRead();
-                read_buf = cycle_reader.startRead();
+                read_txn.finish();
+                read_txn = cycle_reader.startRead();
                 buf_amt_read = 0;
             }
 
-            const new_amt_written = @min(file.size - file_amt_written, read_buf.len - buf_amt_read);
+            const new_amt_written = @min(file.size - file_amt_written, read_txn.len() - buf_amt_read);
             if (write) {
-                try file.file.writeAll(read_buf[buf_amt_read..buf_amt_read + new_amt_written]);
+                try file.file.writeAll(read_txn.buf()[buf_amt_read..buf_amt_read + new_amt_written]);
             }
 
             file_amt_written += new_amt_written;

@@ -106,13 +106,13 @@ fn handle_client(alloc: std.mem.Allocator, client: net.Server.Connection, file_i
     // send bytes
     var cycle_reader = bufs.cycleReader();
     while (true) {
-        const read = cycle_reader.startRead();
+        const read_txn = cycle_reader.startRead();
+        defer read_txn.finish();
+
         //std.debug.print("Writing\n", .{});
-        defer cycle_reader.finishRead();
+        try writer.writeBufToBlock(read_txn.buf());
 
-        try writer.writeBufToBlock(read);
-
-        if (read.len < CryptIO.max_block_size) {
+        if (read_txn.len() < CryptIO.max_block_size) {
             break;
         }
     }
@@ -140,7 +140,7 @@ fn fileReader(file_index: indexing.FileIndex, raw_cycle_writer: CycleBuf.CycleWr
 
     var cycle_writer = raw_cycle_writer;
 
-    var write_buf = cycle_writer.startWrite();
+    var write_txn = cycle_writer.startWrite();
     var buf_amt_written: usize = 0;
 
     for (file_index.files()) |*file| {
@@ -150,17 +150,19 @@ fn fileReader(file_index: indexing.FileIndex, raw_cycle_writer: CycleBuf.CycleWr
 
         var file_amt_read: usize = 0;
         while (file_amt_read < file.size) {
-            const new_amt_read = try file.file.readAll(write_buf[buf_amt_written..]);
+            // read into cycle buffer
+            const new_amt_read = try file.file.readAll(write_txn.buf()[buf_amt_written..]);
             if (new_amt_read == 0) {
                 return error.UnexpectedEOF;
             }
             file_amt_read += new_amt_read;
             buf_amt_written += new_amt_read;
 
-            if (buf_amt_written == write_buf.len) {
+            // if buffer full, make a new one
+            if (buf_amt_written == CryptIO.max_block_size) {
                 //std.debug.print("Reading {s}\n", .{file.path.bytes()});
-                cycle_writer.finishWrite(buf_amt_written);
-                write_buf = cycle_writer.startWrite();
+                write_txn.finish(CryptIO.max_block_size);
+                write_txn = cycle_writer.startWrite();
                 buf_amt_written = 0;
             }
         }
@@ -170,9 +172,9 @@ fn fileReader(file_index: indexing.FileIndex, raw_cycle_writer: CycleBuf.CycleWr
     }
 
     if (buf_amt_written != 0) {
-        cycle_writer.finishWrite(buf_amt_written);
+        write_txn.finish(buf_amt_written);
     } else {
-        _ = cycle_writer.startWrite();
-        cycle_writer.finishWrite(0);
+        write_txn = cycle_writer.startWrite();
+        write_txn.finish(0);
     }
 }
