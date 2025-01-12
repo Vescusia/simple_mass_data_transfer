@@ -14,6 +14,7 @@ pub fn writeFileIndex(msg_writer: anytype, file_index: indexing.FileIndex) !void
     for (file_index.files()) |file| {
         try msg_writer.putInt(file.id);
         try msg_writer.putInt(file.size);
+        try msg_writer.putInt(file.already_read);
         try msg_writer.writeMessage(file.path.bytes());
         try msg_writer.putInt(file.modified);
     }
@@ -22,18 +23,19 @@ pub fn writeFileIndex(msg_writer: anytype, file_index: indexing.FileIndex) !void
 /// The files in the returned `FileIndex` will **not** be open
 ///
 /// File index needs to be deallocated using `deinit`
-pub fn readFileIndex(alloc: std.mem.Allocator, msg_reader: anytype) !?indexing.FileIndex {
+pub fn readFileIndex(alloc: std.mem.Allocator, msg_reader: anytype) !indexing.FileIndex {
     // receive file index length
-    const index_len = try msg_reader.readInt(u64) orelse return null;
+    const index_len = try msg_reader.readInt(u64);
     var file_index = try indexing.FileIndex.initCapacity(alloc, @as(usize, index_len));
 
     // receive files
     for (0..index_len) |_| {
-        try file_index.rawAdd(.{
-            .id = try msg_reader.readInt(u128) orelse return null,
-            .size = try msg_reader.readInt(u64) orelse return null,
-            .path = indexing.PathBuf.from(try msg_reader.readMessage() orelse return null),
-            .modified = try msg_reader.readInt(i128) orelse return null,
+        try file_index.addRaw(.{
+            .id = try msg_reader.readInt(u128),
+            .size = try msg_reader.readInt(u64),
+            .already_read = try msg_reader.readInt(u64),
+            .path = indexing.PathBuf.from(try msg_reader.readMessage()),
+            .modified = try msg_reader.readInt(i128),
             .file = undefined,
         });
     }

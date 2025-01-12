@@ -8,29 +8,33 @@ pub const max_path_len = 1 << 14;
 
 pub const FileIndex = struct {
     list: std.ArrayList(FileIndexEntry),
-    total_size: u64 = 0,
+    /// Total remaining (i.e. `.size - .already_read`) of all files combined
+    total_remaining_size: u64 = 0,
 
     pub const FileIndexEntry = struct {
+        /// The relative path to the file
         path: PathBuf,
         file: fs.File,
         id: u128,
         size: u64,
+        already_read: u64 = 0,
         modified: i128,
-        lock: std.Thread.Mutex = std.Thread.Mutex{},
 
         pub fn format(self: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
             _ = fmt;
             _ = options;
 
-            try std.fmt.format(writer, "'{s}': {} B - {x}\n", .{ self.path.bytes(), self.size, self.id });
+            try std.fmt.format(writer, "'{s}': {} / {} B - {x}\n",
+                .{ self.path.bytes(), self.already_read, self.size, self.id }
+            );
         }
 
-        fn fileMetaToId(name: []const u8, modified: i128) u128 {
+        fn fileMetaToId(rel_path: []const u8, modified: i128) u128 {
             // create id array
             var id_arr: [@sizeOf(u128)]u8 = undefined;
 
             // hash name into id
-            std.crypto.hash.Md5.hash(name, &id_arr, .{});
+            std.crypto.hash.Md5.hash(rel_path, &id_arr, .{});
 
             // convert id into u128
             var id = std.mem.bytesToValue(u128, &id_arr);
@@ -41,38 +45,48 @@ pub const FileIndex = struct {
             return id;
         }
 
-        /// * `path`: the path to the file (may be relative)
+        /// * `path`: the path to the file (must be relative)
         /// * `file`: open file descriptor
-        pub fn fromFile(path: PathBuf, file: fs.File) !@This() {
+        pub fn fromFile(rel_path: PathBuf, file: fs.File) !@This() {
             const meta = try file.metadata();
             const modified = meta.modified();
 
             return .{
-                .path = path,
+                .path = rel_path,
                 .file = file,
                 .size = meta.size(),
                 .modified = modified,
-                .id = fileMetaToId(path.name(), modified)
+                .id = fileMetaToId(rel_path.bytes(), modified)
             };
+        }
+
+        fn lessThan(ctx: @TypeOf(.{}), lhs: @This(), rhs: @This()) bool {
+            _ = ctx;
+            return lhs.id < rhs.id;
+        }
+
+        pub fn remaining(self: @This()) u64 {
+            return self.size - self.already_read;
         }
     };
 
-    /// Recalculates the `total_size` by summing all `size`'s from the `FileIndexEntry`'s
-    pub fn recalculateSize(self: *@This()) void {
-        self.total_size = 0;
+    /// Recalculates the `total_remaining_size` by summing all `.remaining()`'s from the `FileIndexEntry`'s
+    pub fn recalculateRenainingSize(self: *@This()) void {
+        self.total_remaining_size = 0;
         for (self.list.items) |file| {
-            self.total_size += file.size;
+            std.debug.assert(file.size >= file.already_read);
+            self.total_remaining_size += file.remaining();
         }
     }
 
-    pub fn rawAdd(self: *@This(), entry: FileIndexEntry) !void {
+    pub fn addRaw(self: *@This(), entry: FileIndexEntry) !void {
         try self.list.append(entry);
-        self.total_size += entry.size;
+        self.total_remaining_size += entry.remaining();
     }
 
     /// Add a file, by providing a (normally *relative*) `path` and a open `file`
     pub fn addFile(self: *@This(), path: PathBuf, file: fs.File) !void {
-        try self.rawAdd(try FileIndexEntry.fromFile(path, file));
+        try self.addRaw(try FileIndexEntry.fromFile(path, file));
     }
 
     /// Call `deinit` or `closeAll`
@@ -109,6 +123,42 @@ pub const FileIndex = struct {
         for (self.files()) |*file| {
             file.path.relativize(rel_path);
         }
+    }
+
+    pub fn sort(self: *@This()) void {
+        std.mem.sort(FileIndexEntry, self.files(), .{}, FileIndexEntry.lessThan);
+    }
+
+    /// Returns the index of the `FileIndexEntry` with id `id`, if it is in the index,
+    /// otherwise `null`
+    ///
+    /// Assumes that index is sorted using `.sort`
+    pub fn binaryFind(self: @This(), id: u128) ?usize {
+        var lower: usize = 0;
+        var upper = self.files().len;
+
+        while (lower != upper) {
+            const new_bound = lower + (upper - lower) / 2;
+            const other_id = self.files()[new_bound].id;
+
+            if (other_id > id) {
+                upper = new_bound;
+            }
+            else if (other_id < id) {
+                lower = new_bound + 1;
+            }
+            else {
+                return new_bound;
+            }
+        }
+
+        return null;
+    }
+
+    pub fn clone(self: @This()) !@This() {
+        var new_self = self;
+        new_self.list = try self.list.clone();
+        return new_self;
     }
 };
 
@@ -220,17 +270,19 @@ pub const PathBuf = struct {
     }
 
     /// Gets the last "part" of the Path.
-    /// Asserts `!lastIsSlash`
+    ///
+    /// Asserts `!.lastIsSlash()` and `.isCanonic()`
     ///
     /// "/home/example/media/.config/cache" -> "cache"
     pub fn name(self: *const Self) []const u8 {
         std.debug.assert(!self.lastIsSlash());
+        std.debug.assert(self.isCanonic());
 
         for (0..self.len) |i| {
             const rev_i = self.len - i;
             const char = self.path_buf[rev_i];
 
-            if (char == '/' or char == '\\') {
+            if (char == '/') {
                 return self.path_buf[rev_i + 1..self.len];
             }
         }
@@ -260,17 +312,20 @@ pub const PathBuf = struct {
 
     /// Asserts that `self` contains at least one character.
     pub fn lastIsSlash(self: Self) bool {
-        const last = self.path_buf[self.len - 1];
-        return last == '/' or last == '\\';
+        return self.path_buf[self.len - 1] == '/';
     }
 
     /// Returns the parental dir path of `self`. If `self` has no parent, returns `null`
+    ///
+    /// Asserts that `self` is canonic (unix-like path)
     pub fn parent(self: *const Self) ?[]const u8 {
+        std.debug.assert(self.isCanonic());
+
         for (0..self.len) |i| {
-            const rev_i = self.len - i;
+            const rev_i = self.len - i - 1;
             const char = self.path_buf[rev_i];
 
-            if (char == '/' or char == '\\') {
+            if (char == '/') {
                 return self.path_buf[0..rev_i];
             }
         }
@@ -279,7 +334,7 @@ pub const PathBuf = struct {
         }
     }
 
-    /// Turns any '\' to '/' and "C:\" to '/'
+    /// Turns any '\' to '/' and "X:\\" to '/'
     pub fn canonicalize(self: *Self) void {
         if (self.len >= 3 and std.mem.startsWith(u8, self.path_buf[1..], ":\\")) {
             std.mem.copyForwards(u8, self.path_buf[0..self.len - 2], self.path_buf[2..self.len]);
@@ -291,6 +346,17 @@ pub const PathBuf = struct {
                 char = '/';
             }
         }
+    }
+
+    /// Checks if `self` is canonical.
+    /// See `.canonicalize()`
+    pub fn isCanonic(self: Self) bool {
+        for (self.bytes()) |char| {
+            if (char == '\\') {
+                return false;
+            }
+        }
+        return true;
     }
 };
 

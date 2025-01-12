@@ -16,6 +16,7 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
         buffers: [buffer_amt]Buffer,
         alloc: std.heap.ArenaAllocator,
         write_update: Condition = .{},
+        read_update: Condition = .{},
 
         const Buffer = struct {
             arr: []u8,
@@ -25,6 +26,7 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
             valid: bool = false,
         };
 
+        pub const buf_size = arr_len;
 
         const Super = @This();
 
@@ -62,7 +64,6 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
 
             const Self = @This();
 
-
             pub const WriteTxn = struct {
                 pos: usize,
                 super: *Super,
@@ -76,11 +77,10 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
                 pub fn finish(self: @This(), written: usize) void {
                     const current_buf = &self.super.buffers[self.pos];
 
-                    defer self.super.write_update.signal();
-                    defer current_buf.mutex.unlock();
-
                     current_buf.valid = true;
                     current_buf.written = written;
+                    current_buf.mutex.unlock();
+                    self.super.write_update.signal();
                 }
             };
 
@@ -94,7 +94,13 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
                 const super = self.super;
 
                 const buf = &super.buffers[self.pos];
+
                 buf.mutex.lock();
+
+                // wait for reader to read this buffer
+                while (buf.valid) {
+                    super.read_update.wait(&buf.mutex);
+                }
 
                 defer self.pos = (self.pos + 1) % buffer_amt;
 
@@ -138,10 +144,11 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
                 /// allowing writers to overwrite it
                 pub fn finish(self: @This()) void {
                     const super = self.super.super;
-
                     defer self.super.read_active = false;
 
+                    super.buffers[self.pos].valid = false;
                     super.buffers[self.pos].mutex.unlock();
+                    super.read_update.signal();
                 }
             };
 
@@ -160,6 +167,8 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
                 const buf = &super.buffers[self.pos];
 
                 buf.mutex.lock();
+
+                // wait for writer to write to this buffer
                 while (!buf.valid) {
                     super.write_update.wait(&buf.mutex);
                 }

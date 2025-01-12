@@ -7,7 +7,7 @@ const cryptio = @import("cryptio.zig");
 
 
 // Declare SMD-Transfer Protocol Version
-pub const proto_version: u8 = 2;
+pub const proto_version: u8 = 3;
 
 // Create EncryptedIO
 // 1 << 20 seems to work well on my system

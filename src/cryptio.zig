@@ -7,6 +7,9 @@ const chacha = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const ad: [0]u8 = undefined;
 
 
+const UnexpectedEOF = error.UnexpectedEOF;
+
+
 pub fn EncryptedIO(maximum_message_size: usize) type {
     return struct {
         /// The maximum size a message may be
@@ -40,12 +43,12 @@ pub fn EncryptedIO(maximum_message_size: usize) type {
                 /// Will instantly read the initial nonce from the reader.
                 /// Make sure that every reader `.init` matches exactly one writer `.init`.
                 ///
-                /// Returns `null`, when the reader reaches EOF before the initial nonce could be read.
-                pub fn init(reader: ReaderT) !?Self {
+                /// Returns `error.unexpectedEOF`, when the reader reaches EOF before the initial nonce could be read.
+                pub fn init(reader: ReaderT) !Self {
                     // read initial nonce
                     var nonce: [chacha.nonce_length]u8 = undefined;
                     if (try reader.readAll(&nonce) < nonce.len) {
-                        return null;
+                        return UnexpectedEOF;
                     }
 
                     return Self {
@@ -57,7 +60,7 @@ pub fn EncryptedIO(maximum_message_size: usize) type {
                 /// Reads and decrypts a block of arbitrary size into the `content_buf`.
                 /// Asserts that `self.validContentLeft() < max_block_size` i.e.
                 /// do not call this method if there is, by definition, still enough content left.
-                fn readBlock(self: *Self) !?void {
+                fn readBlock(self: *Self) !void {
                     // copy old content into first half of content buffer
                     @memcpy(
                         self.content_buf[max_block_size - self.validContentLeft()..max_block_size],
@@ -66,7 +69,7 @@ pub fn EncryptedIO(maximum_message_size: usize) type {
                     self.content_start = max_block_size - self.validContentLeft();
 
                     // read and decrypt a new block into the content buffer
-                    const amt_read = try self.readBlockToBuf(self.content_buf[max_block_size..]) orelse return null;
+                    const amt_read = try self.readBlockToBuf(self.content_buf[max_block_size..]);
                     self.content_end = max_block_size + amt_read;
                 }
 
@@ -74,7 +77,7 @@ pub fn EncryptedIO(maximum_message_size: usize) type {
                 /// Returns the amount of bytes written to `buf`
                 ///
                 /// Asserts that `buf.len >= max_block_size`
-                pub fn readBlockToBuf(self: *Self, buf: []u8) !?usize {
+                pub fn readBlockToBuf(self: *Self, buf: []u8) !usize {
                     std.debug.assert(buf.len >= max_block_size);
 
                     // handle block overreading of previous call and reset self.block_read
@@ -94,7 +97,7 @@ pub fn EncryptedIO(maximum_message_size: usize) type {
                     while (self.block_read < block_header_size) {
                         const new_read = try self.reader.read(self.block_buf[self.block_read..]);
                         if (new_read == 0) {
-                            return null;
+                            return UnexpectedEOF;
                         }
                         self.block_read += new_read;
                     }
@@ -112,7 +115,7 @@ pub fn EncryptedIO(maximum_message_size: usize) type {
                     while (self.block_read < self.block_end) {
                         const new_read = try self.reader.read(self.block_buf[self.block_read..]);
                         if (new_read == 0) {
-                            return null;
+                            return UnexpectedEOF;
                         }
                         self.block_read += new_read;
                     }
@@ -144,16 +147,16 @@ pub fn EncryptedIO(maximum_message_size: usize) type {
                 }
 
                 /// Ensure that at least `space` valid bytes are in `self.content_buf`
-                fn ensureContent(self: *Self, space: usize) !?void {
+                fn ensureContent(self: *Self, space: usize) !void {
                     while (self.validContentLeft() < space) {
-                        try self.readBlock() orelse return null;
+                        try self.readBlock();
                     }
                 }
 
                 /// Reads a message from the encrypted underlying reader.
-                pub fn readMessage(self: *Self) !?[]const u8 {
+                pub fn readMessage(self: *Self) ![]const u8 {
                     // fill content buffer if it's basically empty
-                    try self.ensureContent(msg_size_size) orelse return null;
+                    try self.ensureContent(msg_size_size);
 
                     // extract message size
                     const msg_size = std.mem.bigToNative(MsgSizeT, std.mem.bytesToValue(MsgSizeT, self.content_buf[self.content_start..self.content_start + msg_size_size]));
@@ -162,7 +165,7 @@ pub fn EncryptedIO(maximum_message_size: usize) type {
                     std.debug.assert(msg_size <= max_msg_size);
 
                     // refill the content buffer if we do not have enough content
-                    try self.ensureContent(msg_size) orelse return null;
+                    try self.ensureContent(msg_size);
                     defer self.content_start += msg_size;
 
                     // extract message
@@ -174,10 +177,10 @@ pub fn EncryptedIO(maximum_message_size: usize) type {
                 /// Reads a raw integer from the buffer.
                 ///
                 /// See `EncryptedWriter.putInt`
-                pub fn readInt(self: *Self, IntT: type) !?IntT {
+                pub fn readInt(self: *Self, IntT: type) !IntT {
                     std.debug.assert(IntT != usize);
 
-                    try self.ensureContent(@sizeOf(IntT)) orelse return null;
+                    try self.ensureContent(@sizeOf(IntT));
                     defer self.content_start += @sizeOf(IntT);
 
                     const int_bytes = self.content_buf[self.content_start..self.content_start + @sizeOf(IntT)];
