@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const Condition = std.Thread.Condition;
-const Mutex = std.Thread.Mutex;
+const AtomicValue = std.atomic.Value;
+const Futex = std.Thread.Futex;
 
 
 /// A Thread Safe Cyclic Buffer, with `buffer_amt` amount of Buffers of length `arr_len`
@@ -9,21 +9,19 @@ const Mutex = std.Thread.Mutex;
 /// A larger `buffer_amt` will cushion latency spikes better.
 ///
 /// The `arr_len` should be tuned to the Reader/Writer and allow them to fully use their IO Bursts
-pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
+pub fn CycleBuffers(comptime buffer_amt: u32, comptime arr_len: usize) type {
     std.debug.assert(buffer_amt >= 3);
 
     return struct {
         buffers: [buffer_amt]Buffer,
         alloc: std.heap.ArenaAllocator,
-        write_update: Condition = .{},
-        read_update: Condition = .{},
+        write_head: AtomicValue(u32) = AtomicValue(u32).init(0),
+        write_tail: AtomicValue(u32) = AtomicValue(u32).init(0),
+        read_pos: AtomicValue(u32) = AtomicValue(u32).init(0),
 
         const Buffer = struct {
             arr: []u8,
             written: usize = 0,
-            mutex: Mutex = .{},
-            /// Just for the initial reader state
-            valid: bool = false,
         };
 
         pub const buf_size = arr_len;
@@ -60,12 +58,13 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
 
         pub const CycleWriter = struct {
             super: *Super,
-            pos: usize = 0,
+            pos: u32 = 0,
 
             const Self = @This();
 
             pub const WriteTxn = struct {
-                pos: usize,
+                pos: u32,
+                finish_pos: u32,
                 super: *Super,
 
                 pub fn buf(self: @This()) []u8 {
@@ -74,13 +73,16 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
 
                 /// Finishes the write transaction, allowing
                 /// the reader to start reading the buffer
+                ///
+                /// * `written`: the amount of valid bytes written
+                ///
+                /// Finishing a write transaction out of order will implicitly finish all transactions before it.
+                /// Finishing a write transaction after already having finished a later one, will cause a deadlock.
                 pub fn finish(self: @This(), written: usize) void {
-                    const current_buf = &self.super.buffers[self.pos];
+                    self.super.buffers[self.pos].written = written;
 
-                    current_buf.valid = true;
-                    current_buf.written = written;
-                    current_buf.mutex.unlock();
-                    self.super.write_update.signal();
+                    self.super.write_tail.store(self.finish_pos, .release);
+                    Futex.wake(&self.super.write_tail, 1);
                 }
             };
 
@@ -93,20 +95,25 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
             pub fn startWrite(self: *Self) WriteTxn {
                 const super = self.super;
 
-                const buf = &super.buffers[self.pos];
+                const old_write_head = super.write_head.load(.acquire);
 
-                buf.mutex.lock();
+                // progress write head
+                const new_write_head = (old_write_head + 1) % buffer_amt;
+                defer super.write_head.store(new_write_head, .release);
+                defer Futex.wake(&super.write_head, 1);
 
-                // wait for reader to read this buffer
-                while (buf.valid) {
-                    super.read_update.wait(&buf.mutex);
+                // wait for read tail to progress further, such that we can write to this buffer
+                var read_pos = super.read_pos.load(.monotonic);
+                while (new_write_head == read_pos) {
+                    Futex.wait(&super.read_pos, new_write_head);
+                    read_pos = super.read_pos.load(.monotonic);
                 }
-
-                defer self.pos = (self.pos + 1) % buffer_amt;
+                super.read_pos.fence(.acquire);
 
                 return .{
-                    .pos = self.pos,
-                    .super = self.super,
+                    .pos = old_write_head,
+                    .finish_pos = new_write_head,
+                    .super = super,
                 };
             }
         };
@@ -122,11 +129,10 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
         pub const CycleReader = struct {
             super: *Super,
             read_active: bool = false,
-            pos: usize = 0,
 
 
             const ReadTxn = struct {
-                pos: usize,
+                pos: u32,
                 super: *CycleReader,
 
                 pub fn buf(self: @This()) []const u8 {
@@ -143,12 +149,14 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
                 /// Finish reading the buffer,
                 /// allowing writers to overwrite it
                 pub fn finish(self: @This()) void {
-                    const super = self.super.super;
+                    std.debug.assert(self.super.read_active);
                     defer self.super.read_active = false;
 
-                    super.buffers[self.pos].valid = false;
-                    super.buffers[self.pos].mutex.unlock();
-                    super.read_update.signal();
+                    const super = self.super.super;
+
+                    // progress reader
+                    super.read_pos.store((self.pos + 1) % buffer_amt, .release);
+                    Futex.wake(&super.read_pos, std.math.maxInt(u32));
                 }
             };
 
@@ -159,24 +167,23 @@ pub fn CycleBuffers(comptime buffer_amt: usize, comptime arr_len: usize) type {
             ///
             /// Will Block if the Writer is too slow.
             pub fn startRead(self: *@This()) ReadTxn {
+                std.debug.assert(!self.read_active);
+                self.read_active = true;
+
                 const super = self.super;
 
-                std.debug.assert(self.read_active == false);
-                defer self.read_active = true;
+                const read_pos = super.read_pos.load(.acquire);
 
-                const buf = &super.buffers[self.pos];
-
-                buf.mutex.lock();
-
-                // wait for writer to write to this buffer
-                while (!buf.valid) {
-                    super.write_update.wait(&buf.mutex);
+                // wait for writer to progress if it's still writing to this buffer
+                var write_tail = super.write_tail.load(.monotonic);
+                while (write_tail == read_pos) {
+                    Futex.wait(&super.write_tail, read_pos);
+                    write_tail = super.write_tail.load(.monotonic);
                 }
-
-                defer self.pos = (self.pos + 1) % buffer_amt;
+                super.write_tail.fence(.acquire);
 
                 return .{
-                    .pos = self.pos,
+                    .pos = read_pos,
                     .super = self,
                 };
             }
@@ -201,20 +208,21 @@ test "basic functionality" {
     const text0 = "01234567"[0..];
     const text1 = "ZATTYZAT"[0..];
 
-    var write_buf = writer.startWrite();    // writer 0; reader 0
-    @memcpy(write_buf[0..text0.len], text0);
-    writer.finishWrite(text0.len);          // writer 1; reader 0
-    write_buf = writer.startWrite();        // writer 1; reader 0
-    @memcpy(write_buf[0..text1.len], text1);
-    writer.finishWrite(text1.len);          // writer 2; reader 0
-    // another finishWrite would have to wait for the reader to advance.
+    var write_txn = writer.startWrite();    // write_head 1; write_tail: 0; reader 0
+    @memcpy(write_txn.buf()[0..text0.len], text0);
+    write_txn.finish(text0.len);            // write_head 1; write_tail: 1; reader 0
+    write_txn = writer.startWrite();        // write_head 2; write_tail: 1; reader 0
+    @memcpy(write_txn.buf()[0..text1.len], text1);
+    write_txn.finish(text1.len);            // write_head 2; write_tail: 2; reader 0
+    // starting another write would block here
 
-    var read_buf = reader.startRead();      // writer 2; reader 0
-    try std.testing.expect(std.mem.eql(u8, read_buf, text0));
-    reader.finishRead();                    // writer 2; reader 1
-    read_buf= reader.startRead();           // writer 2; reader 1
-    try std.testing.expect(std.mem.eql(u8, read_buf, text1));
-    // another finishRead would have to wait for the writer to advance.
+    var read_txn = reader.startRead();      // write_head 2; write_tail: 2; reader 0
+    try std.testing.expect(std.mem.eql(u8, read_txn.buf(), text0));
+    read_txn.finish();                      // write_head 2; write_tail: 2; reader 1
+    read_txn = reader.startRead();          // write_head 2; write_tail: 2; reader 1
+    try std.testing.expect(std.mem.eql(u8, read_txn.buf(), text1));
+    read_txn.finish();                      // write_head 2; write_tail: 2; reader 2
+    // starting another read would block here
 }
 
 test {

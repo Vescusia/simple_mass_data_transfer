@@ -147,8 +147,8 @@ fn fileWriter(file_index: *indexing.FileIndex, raw_cycle_reader: CycleBuffers.Cy
 
     var read_txn = cycle_reader.startRead();
     var buf_amt_read: usize = 0;
+    var is_buf_full: bool = false;
 
-    // TODO: writev
     // iterate over all files
     for (file_index.files()) |*file| {
         defer file.file.close();
@@ -157,10 +157,12 @@ fn fileWriter(file_index: *indexing.FileIndex, raw_cycle_reader: CycleBuffers.Cy
         errdefer writeSmdRes(base_dir_path, file.*);
 
         while (file.size > file.already_read) {
-            if (buf_amt_read == read_txn.len()) {
+            // refill buffer if necessary
+            if (is_buf_full) {
                 read_txn.finish();
                 read_txn = cycle_reader.startRead();
                 buf_amt_read = 0;
+                is_buf_full = false;
 
                 // check for main thread error condition
                 if (read_txn.len() == 0) {
@@ -168,8 +170,18 @@ fn fileWriter(file_index: *indexing.FileIndex, raw_cycle_reader: CycleBuffers.Cy
                 }
             }
 
-            // write
-            const new_amt_written = @min(file.size - file.already_read, read_txn.len() - buf_amt_read);
+            // calculate the amount of new bytes going to be written to the file
+            const new_amt_written = blk: {
+                if (read_txn.len() - buf_amt_read <= file.size - file.already_read) {
+                    is_buf_full = true;
+                    break :blk read_txn.len() - buf_amt_read;
+                }
+                else {
+                    break :blk file.size - file.already_read;
+                }
+            };
+
+            // write buffer to file
             if (write) {
                 try file.file.writeAll(read_txn.buf()[buf_amt_read..buf_amt_read + new_amt_written]);
             }

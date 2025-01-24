@@ -26,8 +26,8 @@ pub fn server(alloc: std.mem.Allocator) !void {
     var listener = try address.listen(.{ .reuse_address = true, .reuse_port = true });
 
     // create absolute path
-    //working_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\simple_mass_data_transfer");
-    working_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\test1");
+    working_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\simple_mass_data_transfer");
+    //working_dir = try std.fs.realpathAlloc(alloc, "C:\\Users\\Administrator\\Programs\\Zig\\test1");
     defer alloc.free(working_dir);
 
     // index files
@@ -195,28 +195,27 @@ fn fileReader(file_index: *indexing.FileIndex, raw_cycle_writer: CycleBuf.CycleW
 
             // index of the first write_txn/iovec that still can still be written to
             var first_unfinished_i: usize = 0;
-            {
-                // resize iovecs
-                var i: usize = 0;
-                while (new_amt_read > 0) : (i += 1) {
-                    const iovec = &iovecs[i];
+			// resize iovecs
+			for (0.., write_txns, &iovecs) |i, write_txn, *iovec| {
+				// @min(new_amt_read, iovec.len)
+				const min = blk: {
+					if (new_amt_read >= iovec.len) {
+						// finish full buffer
+						write_txn.finish(buf_size);
+						first_unfinished_i = i + 1;
+						break :blk iovec.len;
+					}
+					else break :blk new_amt_read;
+				};
 
-                    // @min(new_amt_read, iovec.len)
-                    const min = blk: {
-                        if (new_amt_read >= iovec.len) {
-                            // finish full buffer
-                            write_txns[i].finish(buf_size);
-                            first_unfinished_i = i + 1;
-                            break :blk iovec.len;
-                        }
-                        else break :blk new_amt_read;
-                    };
-
-                    iovec.base += min;
-                    iovec.len -= min;
-                    new_amt_read -= min;
-                }
-            }
+				iovec.base += min;
+				iovec.len -= min;
+				new_amt_read -= min;
+				
+				if (new_amt_read == 0) {
+					break;
+				}
+			}
 
             // renew buffers and empty iovecs
             if (first_unfinished_i > 0) {
